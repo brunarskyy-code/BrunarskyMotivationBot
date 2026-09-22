@@ -65,16 +65,13 @@ def study_level(avg):
 
 def study_bonus(tg_id, month):
     c=db()
-    rows=c.execute("SELECT avg FROM subjects WHERE tg_id=? AND month=?",(tg_id,month)).fetchall()
+    r=c.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE tg_id=? AND month=? AND category='study' AND status='approved'",(tg_id,month)).fetchone()
     c.close()
-    n=len(rows)
-    if not n: return 0
-    # Each subject contributes its level divided by number of reported subjects.
-    return round(sum(study_level(float(r["avg"])) for r in rows)/n)
+    return int(r["s"])
 
 def approved_bonus(tg_id, month):
     c=db()
-    r=c.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE tg_id=? AND month=? AND status='approved'",(tg_id,month)).fetchone()
+    r=c.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE tg_id=? AND month=? AND category!='study' AND status='approved'",(tg_id,month)).fetchone()
     c.close()
     return int(r["s"])
 
@@ -155,12 +152,30 @@ async def subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not items:
             await update.message.reply_text("Поки немає жодного предмета. Введи назву."); return SUBJECT
         c=db(); m=month_key()
+        # Зберігаємо предмети для історії, але вони НЕ потрапляють у виплату до підтвердження Андрієм.
         c.execute("DELETE FROM subjects WHERE tg_id=? AND month=?",(update.effective_user.id,m))
         c.executemany("INSERT INTO subjects(tg_id,month,subject,avg) VALUES(?,?,?,?)",
                       [(update.effective_user.id,m,s,a) for s,a in items])
+        calc=round(sum(study_level(float(a)) for _,a in items)/len(items))
+        details="\n".join(f"• {subj}: {a:g}" for subj,a in items)
+        # Лише одна актуальна заявка на навчання за місяць.
+        c.execute("DELETE FROM entries WHERE tg_id=? AND month=? AND category='study' AND status='pending'",(update.effective_user.id,m))
+        cur=c.execute("INSERT INTO entries(tg_id,month,category,description,amount,status) VALUES(?,?,?,?,?,'pending')",
+                      (update.effective_user.id,m,'study',details,calc))
+        eid=cur.lastrowid
         c.commit(); c.close()
-        b=study_bonus(update.effective_user.id,m)
-        await update.message.reply_text(f"Навчання збережено. Розрахований бонус за навчання: {b} грн.", reply_markup=MENU_CHILD)
+        u=get_user(update.effective_user.id); aid=admin_id()
+        if aid:
+            kb=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✅ Підтвердити {calc} грн",callback_data=f"studyok:{eid}"),
+                InlineKeyboardButton("❌ Відхилити",callback_data=f"studyno:{eid}")
+            ]])
+            await context.bot.send_message(aid,
+                f"📚 {u['name']} — навчання {m}\n{details}\n\nРозрахунок: {calc} грн\n⚠️ У підсумок не входить до твого підтвердження.",
+                reply_markup=kb)
+        await update.message.reply_text(
+            f"Навчання надіслано Андрію на підтвердження. Розрахунок: {calc} грн.\nДо підсумку поки не додано.",
+            reply_markup=MENU_CHILD)
         return ConversationHandler.END
     context.user_data["current_subject"]=t
     await update.message.reply_text(f"Середній бал з «{t}» за місяць (0–12):")
@@ -179,6 +194,22 @@ async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Скасовано.", reply_markup=MENU_CHILD)
     return ConversationHandler.END
+
+async def study_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    action,eid=q.data.split(":"); eid=int(eid)
+    c=db(); row=c.execute("SELECT * FROM entries WHERE id=? AND category='study'",(eid,)).fetchone()
+    if not row: c.close(); return
+    if action=="studyok":
+        c.execute("UPDATE entries SET status='approved' WHERE id=?",(eid,)); c.commit(); c.close()
+        await q.edit_message_text(q.message.text+f"\n\n✅ Підтверджено: {row['amount']} грн")
+        await context.bot.send_message(row["tg_id"],f"✅ Навчання підтверджено: {row['amount']} грн.")
+    else:
+        c.execute("UPDATE entries SET status='rejected',amount=0 WHERE id=?",(eid,)); c.commit(); c.close()
+        await q.edit_message_text(q.message.text+"\n\n❌ Відхилено")
+        await context.bot.send_message(row["tg_id"],"❌ Звіт по навчанню відхилено. Виправ дані та подай ще раз.")
 
 # ----- achievement flow -----
 CAT, DESC = range(2,4)
@@ -270,8 +301,26 @@ async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts=[]
     for k in kids:
         s,o,b,t=summary(k["tg_id"],m)
-        parts.append(f"{k['name']}: навчання {s}, інші {o}, бонус {b}, разом {t} грн")
-    await update.message.reply_text("📊 "+m+"\n"+"\n".join(parts))
+        c=db()
+        subj=c.execute("SELECT subject,avg FROM subjects WHERE tg_id=? AND month=? ORDER BY subject",(k["tg_id"],m)).fetchall()
+        ents=c.execute("SELECT category,description,amount,status FROM entries WHERE tg_id=? AND month=? ORDER BY id",(k["tg_id"],m)).fetchall()
+        c.close()
+        lines=[f"👤 {k['name']}",f"База: {BASE} грн"]
+        lines.append(f"📚 Навчання підтверджено: +{s} грн")
+        if subj:
+            lines.extend([f"   • {r['subject']}: {r['avg']:g}" for r in subj])
+        pending_study=[r for r in ents if r['category']=='study' and r['status']=='pending']
+        if pending_study:
+            lines.append(f"   ⏳ Очікує підтвердження: {pending_study[-1]['amount']} грн")
+        for r in ents:
+            if r['category']=='study': continue
+            icon="✅" if r['status']=='approved' else ("⏳" if r['status']=='pending' else "❌")
+            label=CATS.get(r['category'],(r['category'],0))[0]
+            amt=f"+{r['amount']} грн" if r['status']=='approved' else "не враховано"
+            lines.append(f"{icon} {label}: {r['description']} — {amt}")
+        lines += [f"Інші підтверджені: +{o} грн",f"Бонус разом: {b} грн",f"💰 РАЗОМ: {t} грн"]
+        parts.append("\n".join(lines))
+    await update.message.reply_text("📊 "+m+"\n\n"+"\n\n".join(parts))
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -291,13 +340,21 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  WHERE e.status='pending' ORDER BY e.id""").fetchall(); c.close()
         if not rows: await update.message.reply_text("Немає записів на підтвердження."); return
         for r in rows:
-            kb=InlineKeyboardMarkup([[
-                InlineKeyboardButton("0",callback_data=f"amt:{r['id']}:0"),
-                InlineKeyboardButton("300",callback_data=f"amt:{r['id']}:300"),
-                InlineKeyboardButton("500",callback_data=f"amt:{r['id']}:500"),
-                InlineKeyboardButton("700",callback_data=f"amt:{r['id']}:700")
-            ],[InlineKeyboardButton("Інша сума",callback_data=f"custom:{r['id']}")]])
-            await update.message.reply_text(f"{r['name']}: {CATS[r['category']][0]}\n{r['description']}",reply_markup=kb)
+            if r['category']=='study':
+                kb=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"✅ Підтвердити {r['amount']} грн",callback_data=f"studyok:{r['id']}"),
+                    InlineKeyboardButton("❌ Відхилити",callback_data=f"studyno:{r['id']}")
+                ]])
+                txt=f"📚 {r['name']} — навчання\n{r['description']}\n\nРозрахунок: {r['amount']} грн\n⏳ Ще НЕ входить у підсумок."
+            else:
+                kb=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("0",callback_data=f"amt:{r['id']}:0"),
+                    InlineKeyboardButton("300",callback_data=f"amt:{r['id']}:300"),
+                    InlineKeyboardButton("500",callback_data=f"amt:{r['id']}:500"),
+                    InlineKeyboardButton("700",callback_data=f"amt:{r['id']}:700")
+                ],[InlineKeyboardButton("Інша сума",callback_data=f"custom:{r['id']}")]])
+                txt=f"{r['name']}: {CATS[r['category']][0]}\n{r['description']}"
+            await update.message.reply_text(txt,reply_markup=kb)
 
 def main():
     db().close()
@@ -309,6 +366,7 @@ def main():
     app.add_handler(CallbackQueryHandler(join_cb,pattern=r"^join(ok|no):"))
     app.add_handler(CallbackQueryHandler(amount_cb,pattern=r"^amt:"))
     app.add_handler(CallbackQueryHandler(custom_cb,pattern=r"^custom:"))
+    app.add_handler(CallbackQueryHandler(study_cb,pattern=r"^study(ok|no):"))
     app.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📝 Підсумки місяця$"),report_start)],
         states={SUBJECT:[MessageHandler(filters.TEXT & ~filters.COMMAND,subject)],
