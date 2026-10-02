@@ -37,13 +37,22 @@ CATS = {
 MENU_CHILD = ReplyKeyboardMarkup([
     ["📝 Підсумки місяця", "📊 Мій підсумок"],
     ["➕ Додати досягнення", "✏️ Мої записи"],
-    ["❓ Правила"]
+    ["💬 Андрію", "❓ Правила"]
 ], resize_keyboard=True)
 
 MENU_ADMIN = ReplyKeyboardMarkup([
     ["👥 Звіти Влада і Ромчика", "✅ На підтвердження"],
     ["📊 Підсумок місяця", "🗑 Скинути місяць"],
-    ["❓ Правила"]
+    ["⚙️ Навчання", "💬 Повідомлення"],
+    ["📚 Історія", "❓ Правила"]
+], resize_keyboard=True)
+
+CHAT_CHILD_MENU = ReplyKeyboardMarkup([
+    ["⬅️ Вийти з чату"]
+], resize_keyboard=True)
+
+CHAT_ADMIN_MENU = ReplyKeyboardMarkup([
+    ["⬅️ Вийти з чату"]
 ], resize_keyboard=True)
 
 
@@ -84,6 +93,130 @@ def db():
             status TEXT DEFAULT 'pending'
         )
     """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS study_subjects(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS study_prices(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_id INTEGER NOT NULL,
+            min_grade REAL NOT NULL,
+            amount INTEGER NOT NULL,
+            UNIQUE(subject_id, min_grade)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS study_snapshots(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id INTEGER NOT NULL,
+            subject_id INTEGER,
+            subject_name TEXT NOT NULL,
+            avg REAL NOT NULL,
+            calculated_amount INTEGER NOT NULL,
+            pricing_snapshot TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            child_tg_id INTEGER NOT NULL,
+            sender_tg_id INTEGER NOT NULL,
+            sender_role TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS archived_entries(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_entry_id INTEGER,
+            tg_id INTEGER,
+            month TEXT,
+            category TEXT,
+            description TEXT,
+            amount INTEGER,
+            status TEXT,
+            archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS archived_subjects(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER,
+            month TEXT,
+            subject TEXT,
+            avg REAL,
+            archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS archived_study_snapshots(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_entry_id INTEGER,
+            tg_id INTEGER,
+            month TEXT,
+            subject_id INTEGER,
+            subject_name TEXT,
+            avg REAL,
+            calculated_amount INTEGER,
+            pricing_snapshot TEXT,
+            archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # First migration: if the old bot already has subjects, use those names.
+    cfg_count = c.execute("SELECT COUNT(*) n FROM study_subjects").fetchone()["n"]
+    if cfg_count == 0:
+        old_names = [
+            r["subject"] for r in c.execute("""
+                SELECT DISTINCT subject
+                FROM subjects
+                WHERE TRIM(subject) != ''
+                ORDER BY subject
+            """).fetchall()
+        ]
+        seed_names = old_names or [
+            "Математика",
+            "Фізика",
+            "Англійська",
+            "Геометрія",
+        ]
+        for i, name in enumerate(seed_names):
+            c.execute("""
+                INSERT OR IGNORE INTO study_subjects(name,active,sort_order)
+                VALUES(?,1,?)
+            """, (name, i))
+
+    # Give every configured subject the old scale as a safe default.
+    for row in c.execute("SELECT id FROM study_subjects").fetchall():
+        sid = row["id"]
+        has_prices = c.execute(
+            "SELECT 1 FROM study_prices WHERE subject_id=? LIMIT 1",
+            (sid,)
+        ).fetchone()
+        if not has_prices:
+            c.executemany("""
+                INSERT OR IGNORE INTO study_prices(subject_id,min_grade,amount)
+                VALUES(?,?,?)
+            """, [
+                (sid, 9.5, 700),
+                (sid, 10.0, 1000),
+                (sid, 10.5, 1200),
+                (sid, 11.0, 1500),
+            ])
 
     c.commit()
     return c
@@ -134,6 +267,43 @@ def admin_id():
     c.close()
 
     return r["tg_id"] if r else None
+
+
+def active_subjects():
+    c = db()
+    rows = c.execute("""
+        SELECT id,name
+        FROM study_subjects
+        WHERE active=1
+        ORDER BY sort_order,id
+    """).fetchall()
+    c.close()
+    return [(r["id"], r["name"]) for r in rows]
+
+
+def subject_reward(subject_id, avg):
+    c = db()
+    row = c.execute("""
+        SELECT amount
+        FROM study_prices
+        WHERE subject_id=? AND min_grade<=?
+        ORDER BY min_grade DESC
+        LIMIT 1
+    """, (subject_id, avg)).fetchone()
+    c.close()
+    return int(row["amount"]) if row else 0
+
+
+def subject_pricing_snapshot(subject_id):
+    c = db()
+    rows = c.execute("""
+        SELECT min_grade,amount
+        FROM study_prices
+        WHERE subject_id=?
+        ORDER BY min_grade
+    """, (subject_id,)).fetchall()
+    c.close()
+    return "; ".join(f"{r['min_grade']:g}→{r['amount']}" for r in rows)
 
 
 # =========================================================
@@ -311,7 +481,7 @@ async def join_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # STUDY
 # =========================================================
 
-SUBJECT, AVG = range(2)
+STUDY_GRADE = 20
 
 
 async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -321,7 +491,6 @@ async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     m = month_key()
-
     c = db()
     approved = c.execute("""
         SELECT id FROM entries
@@ -340,221 +509,187 @@ async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    configured = active_subjects()
+    if not configured:
+        await update.message.reply_text(
+            "Немає активних предметів. Андрій має спочатку налаштувати їх.",
+            reply_markup=MENU_CHILD
+        )
+        return ConversationHandler.END
+
+    context.user_data["study_subjects"] = configured
+    context.user_data["study_index"] = 0
     context.user_data["subjects"] = []
 
-    kb = ReplyKeyboardMarkup(
-        [["❌ Скасувати заповнення"]],
-        resize_keyboard=True
-    )
+    sid, name = configured[0]
+    kb = ReplyKeyboardMarkup([["❌ Скасувати заповнення"]], resize_keyboard=True)
 
     await update.message.reply_text(
-        "📚 Починаємо навчання.\n\n"
-        "Напиши назву першого предмета.\n"
-        "Коли всі предмети введені — напиши ГОТОВО.\n\n"
-        "Можеш у будь-який момент натиснути "
-        "«❌ Скасувати заповнення».",
+        f"📚 Навчання за {m}\n\n"
+        f"Предмет 1 з {len(configured)}: «{name}»\n"
+        "Введи середній бал за місяць (0–12).",
         reply_markup=kb
     )
-
-    return SUBJECT
-
-
-async def subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-
-    if t == "❌ Скасувати заповнення":
-        context.user_data.pop("subjects", None)
-        context.user_data.pop("current_subject", None)
-
-        await update.message.reply_text(
-            "Заповнення скасовано. Нічого не збережено.",
-            reply_markup=MENU_CHILD
-        )
-        return ConversationHandler.END
-
-    if t.upper() == "ГОТОВО":
-        items = context.user_data.get("subjects", [])
-
-        if not items:
-            await update.message.reply_text(
-                "Поки немає жодного предмета."
-            )
-            return SUBJECT
-
-        m = month_key()
-        tg = update.effective_user.id
-
-        c = db()
-
-        # Не дозволяємо змінювати вже затверджене
-        approved = c.execute("""
-            SELECT id FROM entries
-            WHERE tg_id=? AND month=?
-            AND category='study'
-            AND status='approved'
-            LIMIT 1
-        """, (tg, m)).fetchone()
-
-        if approved:
-            c.close()
-
-            await update.message.reply_text(
-                "🔒 Цей місяць уже підтверджено.",
-                reply_markup=MENU_CHILD
-            )
-            return ConversationHandler.END
-
-        # Видаляємо попередню НЕПІДТВЕРДЖЕНУ версію
-        c.execute(
-            "DELETE FROM subjects WHERE tg_id=? AND month=?",
-            (tg, m)
-        )
-
-        c.execute("""
-            DELETE FROM entries
-            WHERE tg_id=? AND month=?
-            AND category='study'
-            AND status!='approved'
-        """, (tg, m))
-
-        c.executemany("""
-            INSERT INTO subjects(tg_id,month,subject,avg)
-            VALUES(?,?,?,?)
-        """, [
-            (tg, m, s, a)
-            for s, a in items
-        ])
-
-        calc = round(
-            sum(study_level(float(a)) for _, a in items)
-            / len(items)
-        )
-
-        calc = min(calc, STUDY_CAP)
-
-        details = "\n".join(
-            f"• {subj}: {a:g}"
-            for subj, a in items
-        )
-
-        cur = c.execute("""
-            INSERT INTO entries(
-                tg_id,month,category,
-                description,amount,status
-            )
-            VALUES(?,?,?,?,?,'pending')
-        """, (
-            tg,
-            m,
-            "study",
-            details,
-            calc
-        ))
-
-        eid = cur.lastrowid
-
-        c.commit()
-        c.close()
-
-        u = get_user(tg)
-        aid = admin_id()
-
-        if aid:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"✅ Підтвердити {calc} грн",
-                    callback_data=f"studyok:{eid}"
-                ),
-                InlineKeyboardButton(
-                    "❌ Відхилити",
-                    callback_data=f"studyno:{eid}"
-                )
-            ]])
-
-            await context.bot.send_message(
-                aid,
-                f"📚 {u['name']} — навчання {m}\n\n"
-                f"{details}\n\n"
-                f"Розрахунок: {calc} грн\n"
-                f"⏳ Очікує підтвердження.",
-                reply_markup=kb
-            )
-
-        await update.message.reply_text(
-            f"✅ Дані збережені.\n"
-            f"Розрахунок: {calc} грн.\n\n"
-            f"До підтвердження Андрієм ти можеш "
-            f"виправити або видалити цей запис через "
-            f"«✏️ Мої записи».",
-            reply_markup=MENU_CHILD
-        )
-
-        context.user_data.pop("subjects", None)
-        context.user_data.pop("current_subject", None)
-
-        return ConversationHandler.END
-
-    context.user_data["current_subject"] = t
-
-    await update.message.reply_text(
-        f"Середній бал з «{t}» за місяць (0–12):"
-    )
-
-    return AVG
+    return STUDY_GRADE
 
 
 async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ Скасувати заповнення":
+        context.user_data.pop("study_subjects", None)
+        context.user_data.pop("study_index", None)
         context.user_data.pop("subjects", None)
-        context.user_data.pop("current_subject", None)
-
         await update.message.reply_text(
             "Заповнення скасовано. Нічого не збережено.",
             reply_markup=MENU_CHILD
         )
-
         return ConversationHandler.END
 
     try:
-        a = float(
-            update.message.text.replace(",", ".")
-        )
+        a = float(update.message.text.replace(",", "."))
     except ValueError:
-        await update.message.reply_text(
-            "Введи число, наприклад 10,7."
-        )
-        return AVG
+        await update.message.reply_text("Введи число, наприклад 10,7.")
+        return STUDY_GRADE
 
     if not 0 <= a <= 12:
+        await update.message.reply_text("Бал має бути від 0 до 12.")
+        return STUDY_GRADE
+
+    configured = context.user_data.get("study_subjects", [])
+    idx = context.user_data.get("study_index", 0)
+
+    if idx >= len(configured):
+        await update.message.reply_text("Сесію заповнення вже завершено.", reply_markup=MENU_CHILD)
+        return ConversationHandler.END
+
+    sid, name = configured[idx]
+    reward = subject_reward(sid, a)
+    pricing = subject_pricing_snapshot(sid)
+    context.user_data["subjects"].append((sid, name, a, reward, pricing))
+
+    idx += 1
+    context.user_data["study_index"] = idx
+
+    if idx < len(configured):
+        _, next_name = configured[idx]
         await update.message.reply_text(
-            "Бал має бути від 0 до 12."
+            f"✅ {name}: {a:g}\n"
+            f"Наступний предмет {idx + 1} з {len(configured)}: «{next_name}».\n"
+            "Введи середній бал (0–12)."
         )
-        return AVG
+        return STUDY_GRADE
 
-    s = context.user_data["current_subject"]
+    items = context.user_data.get("subjects", [])
+    m = month_key()
+    tg = update.effective_user.id
 
-    context.user_data["subjects"].append(
-        (s, a)
+    c = db()
+    approved = c.execute("""
+        SELECT id FROM entries
+        WHERE tg_id=? AND month=? AND category='study' AND status='approved'
+        LIMIT 1
+    """, (tg, m)).fetchone()
+
+    if approved:
+        c.close()
+        await update.message.reply_text(
+            "🔒 Цей місяць уже підтверджено.",
+            reply_markup=MENU_CHILD
+        )
+        return ConversationHandler.END
+
+    old_rows = c.execute("""
+        SELECT id FROM entries
+        WHERE tg_id=? AND month=? AND category='study' AND status!='approved'
+    """, (tg, m)).fetchall()
+    for old in old_rows:
+        c.execute("DELETE FROM study_snapshots WHERE entry_id=?", (old["id"],))
+
+    c.execute("DELETE FROM subjects WHERE tg_id=? AND month=?", (tg, m))
+    c.execute("""
+        DELETE FROM entries
+        WHERE tg_id=? AND month=? AND category='study' AND status!='approved'
+    """, (tg, m))
+
+    c.executemany("""
+        INSERT INTO subjects(tg_id,month,subject,avg)
+        VALUES(?,?,?,?)
+    """, [(tg, m, name, grade) for _, name, grade, _, _ in items])
+
+    calc = round(sum(reward for _, _, _, reward, _ in items) / len(items))
+    calc = min(calc, STUDY_CAP)
+
+    details = "\n".join(
+        f"• {name}: {grade:g} → {reward} грн"
+        for _, name, grade, reward, _ in items
     )
 
+    cur = c.execute("""
+        INSERT INTO entries(
+            tg_id,month,category,description,amount,status
+        )
+        VALUES(?,?,?,?,?,'pending')
+    """, (tg, m, "study", details, calc))
+    eid = cur.lastrowid
+
+    c.executemany("""
+        INSERT INTO study_snapshots(
+            entry_id,subject_id,subject_name,avg,calculated_amount,pricing_snapshot
+        )
+        VALUES(?,?,?,?,?,?)
+    """, [
+        (eid, sid, name, grade, reward, pricing)
+        for sid, name, grade, reward, pricing in items
+    ])
+
+    c.commit()
+    c.close()
+
+    u = get_user(tg)
+    aid = admin_id()
+
+    if aid:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"✅ Підтвердити {calc} грн",
+                callback_data=f"studyok:{eid}"
+            ),
+            InlineKeyboardButton(
+                "❌ Відхилити",
+                callback_data=f"studyno:{eid}"
+            )
+        ]])
+        await context.bot.send_message(
+            aid,
+            f"📚 {u['name']} — навчання {m}\n\n"
+            f"{details}\n\n"
+            f"Розрахунок: {calc} грн\n"
+            "⏳ Очікує підтвердження.",
+            reply_markup=kb
+        )
+
     await update.message.reply_text(
-        "✅ Збережено.\n"
-        "Напиши наступний предмет або ГОТОВО."
-    )
-
-    return SUBJECT
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("subjects", None)
-    context.user_data.pop("current_subject", None)
-    context.user_data.pop("cat", None)
-
-    await update.message.reply_text(
-        "Скасовано.",
+        f"✅ Дані збережені. Розрахунок: {calc} грн.\n\n"
+        "До підтвердження Андрієм звіт можна змінити або видалити "
+        "через «✏️ Мої записи».",
         reply_markup=MENU_CHILD
     )
 
+    context.user_data.pop("study_subjects", None)
+    context.user_data.pop("study_index", None)
+    context.user_data.pop("subjects", None)
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for key in (
+        "study_subjects", "study_index", "subjects",
+        "current_subject", "cat", "edit_eid"
+    ):
+        context.user_data.pop(key, None)
+
+    u = get_user(update.effective_user.id)
+    menu = MENU_ADMIN if u and u["role"] == "admin" else MENU_CHILD
+    await update.message.reply_text("Скасовано.", reply_markup=menu)
     return ConversationHandler.END
 
 
@@ -563,7 +698,6 @@ async def study_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     u = get_user(q.from_user.id)
-
     if not u or u["role"] != "admin":
         return
 
@@ -571,7 +705,6 @@ async def study_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     eid = int(eid)
 
     c = db()
-
     row = c.execute("""
         SELECT * FROM entries
         WHERE id=? AND category='study'
@@ -579,37 +712,27 @@ async def study_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not row:
         c.close()
-        await q.answer("Запис уже видалено.", show_alert=True)
+        await q.answer("Ця версія звіту вже не актуальна.", show_alert=True)
         return
 
     if row["status"] != "pending":
         c.close()
-        await q.answer(
-            "Цей запис уже оброблений.",
-            show_alert=True
-        )
+        await q.answer("Цей запис уже оброблений.", show_alert=True)
         return
 
     if action == "studyok":
-        c.execute(
-            "UPDATE entries SET status='approved' WHERE id=?",
-            (eid,)
-        )
+        c.execute("UPDATE entries SET status='approved' WHERE id=?", (eid,))
         c.commit()
         c.close()
 
         await q.edit_message_text(
-            q.message.text +
-            f"\n\n🔒 ПІДТВЕРДЖЕНО: {row['amount']} грн"
+            q.message.text + f"\n\n🔒 ПІДТВЕРДЖЕНО: {row['amount']} грн"
         )
-
         await context.bot.send_message(
             row["tg_id"],
-            f"✅ Навчання підтверджено: "
-            f"{row['amount']} грн.\n"
-            f"🔒 Дані зафіксовані."
+            f"✅ Навчання підтверджено: {row['amount']} грн.\n"
+            "🔒 Дані та правила розрахунку зафіксовані."
         )
-
     else:
         c.execute(
             "UPDATE entries SET status='rejected', amount=0 WHERE id=?",
@@ -618,15 +741,11 @@ async def study_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.commit()
         c.close()
 
-        await q.edit_message_text(
-            q.message.text +
-            "\n\n❌ ВІДХИЛЕНО"
-        )
-
+        await q.edit_message_text(q.message.text + "\n\n❌ ВІДХИЛЕНО")
         await context.bot.send_message(
             row["tg_id"],
             "❌ Звіт по навчанню відхилено.\n"
-            "Можеш виправити дані та подати заново."
+            "Можеш подати виправлену версію."
         )
 
 
@@ -1287,6 +1406,383 @@ async def edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
+# ADMIN: STUDY SETTINGS
+# =========================================================
+
+async def study_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+
+    c = db()
+    subjects_cfg = c.execute("""
+        SELECT id,name,active
+        FROM study_subjects
+        ORDER BY sort_order,id
+    """).fetchall()
+
+    lines = ["⚙️ Навчання — предмети й ціни", ""]
+    buttons = []
+    for r in subjects_cfg:
+        prices = c.execute("""
+            SELECT min_grade,amount
+            FROM study_prices
+            WHERE subject_id=?
+            ORDER BY min_grade
+        """, (r["id"],)).fetchall()
+        scale = ", ".join(f"{p['min_grade']:g}→{p['amount']}" for p in prices) or "без шкали"
+        state = "✅" if r["active"] else "⛔️"
+        lines.append(f"{state} #{r['id']} {r['name']}: {scale}")
+        buttons.append([
+            InlineKeyboardButton(
+                f"{'Вимкнути' if r['active'] else 'Увімкнути'} #{r['id']}",
+                callback_data=f"subtoggle:{r['id']}"
+            )
+        ])
+    c.close()
+
+    lines += [
+        "",
+        "Додати: /subjectadd Назва",
+        "Перейменувати: /subjectrename ID Нова назва",
+        "Ціна: /price ID БАЛ СУМА",
+        "Видалити поріг: /pricedel ID БАЛ",
+        "",
+        "Приклад: /price 1 10.5 1200",
+    ]
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+    )
+
+
+async def subject_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("Приклад: /subjectadd Математика")
+        return
+
+    c = db()
+    try:
+        cur = c.execute("""
+            INSERT INTO study_subjects(name,active,sort_order)
+            VALUES(?,1,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM study_subjects))
+        """, (name,))
+        sid = cur.lastrowid
+        c.executemany("""
+            INSERT INTO study_prices(subject_id,min_grade,amount)
+            VALUES(?,?,?)
+        """, [
+            (sid, 9.5, 700),
+            (sid, 10.0, 1000),
+            (sid, 10.5, 1200),
+            (sid, 11.0, 1500),
+        ])
+        c.commit()
+        await update.message.reply_text(
+            f"✅ Додано «{name}» (ID {sid}) зі стартовою шкалою."
+        )
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("Такий предмет уже є.")
+    finally:
+        c.close()
+
+
+async def subject_rename_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Приклад: /subjectrename 1 Алгебра")
+        return
+    try:
+        sid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID має бути числом.")
+        return
+    name = " ".join(context.args[1:]).strip()
+    c = db()
+    try:
+        cur = c.execute("UPDATE study_subjects SET name=? WHERE id=?", (name, sid))
+        c.commit()
+        if cur.rowcount:
+            await update.message.reply_text(f"✅ Предмет #{sid} тепер «{name}».")
+        else:
+            await update.message.reply_text("Предмет з таким ID не знайдено.")
+    except sqlite3.IntegrityError:
+        await update.message.reply_text("Предмет з такою назвою вже існує.")
+    finally:
+        c.close()
+
+
+async def subject_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = get_user(q.from_user.id)
+    if not u or u["role"] != "admin":
+        return
+
+    sid = int(q.data.split(":")[1])
+    c = db()
+    row = c.execute("SELECT name,active FROM study_subjects WHERE id=?", (sid,)).fetchone()
+    if not row:
+        c.close()
+        await q.answer("Предмет не знайдено.", show_alert=True)
+        return
+    new_state = 0 if row["active"] else 1
+    c.execute("UPDATE study_subjects SET active=? WHERE id=?", (new_state, sid))
+    c.commit()
+    c.close()
+    await q.edit_message_text(
+        f"{'✅ Увімкнено' if new_state else '⛔️ Вимкнено'}: {row['name']}\n"
+        "Відкрий «⚙️ Навчання» ще раз, щоб побачити актуальний список."
+    )
+
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+    if len(context.args) != 3:
+        await update.message.reply_text("Приклад: /price 1 10.5 1200")
+        return
+    try:
+        sid = int(context.args[0])
+        grade = float(context.args[1].replace(",", "."))
+        amount = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("Невірний формат. Приклад: /price 1 10.5 1200")
+        return
+    if not 0 <= grade <= 12 or amount < 0:
+        await update.message.reply_text("Бал: 0–12, сума: 0 або більше.")
+        return
+
+    c = db()
+    exists = c.execute("SELECT 1 FROM study_subjects WHERE id=?", (sid,)).fetchone()
+    if not exists:
+        c.close()
+        await update.message.reply_text("Предмет з таким ID не знайдено.")
+        return
+    c.execute("""
+        INSERT INTO study_prices(subject_id,min_grade,amount)
+        VALUES(?,?,?)
+        ON CONFLICT(subject_id,min_grade)
+        DO UPDATE SET amount=excluded.amount
+    """, (sid, grade, amount))
+    c.commit()
+    c.close()
+    await update.message.reply_text(f"✅ #{sid}: від {grade:g} бала → {amount} грн.")
+
+
+async def price_del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Приклад: /pricedel 1 10.5")
+        return
+    try:
+        sid = int(context.args[0])
+        grade = float(context.args[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Невірний формат.")
+        return
+    c = db()
+    cur = c.execute(
+        "DELETE FROM study_prices WHERE subject_id=? AND min_grade=?",
+        (sid, grade)
+    )
+    c.commit()
+    c.close()
+    await update.message.reply_text(
+        "✅ Поріг видалено." if cur.rowcount else "Такий поріг не знайдено."
+    )
+
+
+# =========================================================
+# PRIVATE CHAT
+# =========================================================
+
+def chat_history_text(child_tg_id, limit=20):
+    c = db()
+    rows = c.execute("""
+        SELECT sender_role,text,created_at
+        FROM chat_messages
+        WHERE child_tg_id=?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (child_tg_id, limit)).fetchall()
+    c.close()
+    rows = list(reversed(rows))
+    if not rows:
+        return "Історія поки порожня."
+    parts = []
+    for r in rows:
+        who = "Андрій" if r["sender_role"] == "admin" else "Дитина"
+        parts.append(f"{r['created_at']} · {who}: {r['text']}")
+    return "\n".join(parts)
+
+
+async def admin_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+    c = db()
+    kids = c.execute("""
+        SELECT tg_id,name FROM users
+        WHERE role='child'
+        ORDER BY name
+    """).fetchall()
+    c.close()
+    if not kids:
+        await update.message.reply_text("Хлопці ще не підключені.")
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(k["name"], callback_data=f"chatpick:{k['tg_id']}")]
+        for k in kids
+    ])
+    await update.message.reply_text("💬 Кому написати?", reply_markup=kb)
+
+
+async def chat_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    u = get_user(q.from_user.id)
+    if not u or u["role"] != "admin":
+        return
+    tg = int(q.data.split(":")[1])
+    child = get_user(tg)
+    if not child or child["role"] != "child":
+        await q.answer("Користувача не знайдено.", show_alert=True)
+        return
+    context.user_data["chat_mode"] = "admin"
+    context.user_data["chat_child"] = tg
+    await q.edit_message_text(
+        f"💬 Чат з {child['name']}\n\n"
+        f"{chat_history_text(tg)}"
+    )
+    await q.message.reply_text(
+        "Надішли повідомлення. Воно піде тільки цій дитині.",
+        reply_markup=CHAT_ADMIN_MENU
+    )
+
+
+async def child_chat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "child":
+        return
+    context.user_data["chat_mode"] = "child"
+    context.user_data["chat_child"] = u["tg_id"]
+    await update.message.reply_text(
+        f"💬 Приватний чат з Андрієм\n\n{chat_history_text(u['tg_id'])}\n\n"
+        "Напиши повідомлення.",
+        reply_markup=CHAT_CHILD_MENU
+    )
+
+
+async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = context.user_data.get("chat_mode")
+    child_tg = context.user_data.get("chat_child")
+    if not mode or not child_tg:
+        return False
+
+    text = (update.message.text or "").strip()
+    if text == "⬅️ Вийти з чату":
+        context.user_data.pop("chat_mode", None)
+        context.user_data.pop("chat_child", None)
+        u = get_user(update.effective_user.id)
+        menu = MENU_ADMIN if u and u["role"] == "admin" else MENU_CHILD
+        await update.message.reply_text("Чат закрито.", reply_markup=menu)
+        return True
+
+    sender = get_user(update.effective_user.id)
+    if not sender:
+        return True
+
+    if mode == "admin":
+        if sender["role"] != "admin":
+            return True
+        target = get_user(child_tg)
+        if not target or target["role"] != "child":
+            await update.message.reply_text("Цей чат більше недоступний.")
+            return True
+        sender_role = "admin"
+        receiver = child_tg
+        prefix = "💬 Андрій:"
+    else:
+        if sender["role"] != "child" or sender["tg_id"] != child_tg:
+            return True
+        sender_role = "child"
+        receiver = admin_id()
+        prefix = f"💬 {sender['name']}:"
+
+    c = db()
+    c.execute("""
+        INSERT INTO chat_messages(child_tg_id,sender_tg_id,sender_role,text)
+        VALUES(?,?,?,?)
+    """, (child_tg, sender["tg_id"], sender_role, text))
+    c.commit()
+    c.close()
+
+    if receiver:
+        try:
+            await context.bot.send_message(receiver, f"{prefix}\n{text}")
+        except Exception:
+            pass
+
+    await update.message.reply_text("✅ Надіслано.")
+    return True
+
+
+async def history_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+    await update.message.reply_text(
+        "📚 Історія зберігається по місяцях.\n"
+        "Щоб переглянути конкретний місяць: /month 2026-09"
+    )
+
+
+async def month_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = get_user(update.effective_user.id)
+    if not u or u["role"] != "admin":
+        return
+    if not context.args:
+        await update.message.reply_text("Приклад: /month 2026-09")
+        return
+    m = context.args[0].strip()
+    c = db()
+    kids = c.execute("SELECT tg_id,name FROM users WHERE role='child' ORDER BY name").fetchall()
+    blocks = []
+    for k in kids:
+        current = c.execute("""
+            SELECT category,description,amount,status
+            FROM entries WHERE tg_id=? AND month=? ORDER BY id
+        """, (k["tg_id"], m)).fetchall()
+        archived = c.execute("""
+            SELECT category,description,amount,status
+            FROM archived_entries WHERE tg_id=? AND month=? ORDER BY id
+        """, (k["tg_id"], m)).fetchall()
+        rows = list(current) + list(archived)
+        lines = [f"👤 {k['name']}"]
+        if not rows:
+            lines.append("Немає даних.")
+        else:
+            for r in rows:
+                label = "Навчання" if r["category"] == "study" else CATS.get(r["category"], (r["category"], 0))[0]
+                lines.append(f"• {label}: {r['description']} | {r['amount']} грн | {r['status']}")
+        blocks.append("\n".join(lines))
+    c.close()
+    await update.message.reply_text(f"📚 Історія за {m}\n\n" + "\n\n".join(blocks))
+
+
+
+
+# =========================================================
 # SUMMARY
 # =========================================================
 
@@ -1430,40 +1926,31 @@ async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_month_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = get_user(update.effective_user.id)
-
     if not u or u["role"] != "admin":
         return
 
     c = db()
-
     kids = c.execute("""
         SELECT * FROM users
         WHERE role='child'
         ORDER BY name
     """).fetchall()
-
     c.close()
 
     if not kids:
-        await update.message.reply_text(
-            "Хлопці ще не підключені."
-        )
+        await update.message.reply_text("Хлопці ще не підключені.")
         return
 
-    buttons = []
-
-    for k in kids:
-        buttons.append([
-            InlineKeyboardButton(
-                f"🗑 Скинути {k['name']}",
-                callback_data=f"resetask:{k['tg_id']}"
-            )
-        ])
+    buttons = [[
+        InlineKeyboardButton(
+            f"🗑 Скинути {k['name']}",
+            callback_data=f"resetask:{k['tg_id']}"
+        )
+    ] for k in kids]
 
     await update.message.reply_text(
         f"🗑 Скидання місяця {month_key()}\n\n"
-        f"Вибери, кому повністю видалити дані "
-        f"за поточний місяць.",
+        "Дані буде прибрано з активного місяця, але копія залишиться в історії.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -1471,35 +1958,24 @@ async def reset_month_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_ask_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     u = get_user(q.from_user.id)
-
     if not u or u["role"] != "admin":
         return
 
     tg = int(q.data.split(":")[1])
     child = get_user(tg)
-
     if not child or child["role"] != "child":
         return
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "⚠️ ТАК, ВИДАЛИТИ",
-            callback_data=f"resetyes:{tg}"
-        ),
-        InlineKeyboardButton(
-            "❌ Ні",
-            callback_data="resetno:0"
-        )
+        InlineKeyboardButton("⚠️ ТАК, СКИНУТИ", callback_data=f"resetyes:{tg}"),
+        InlineKeyboardButton("❌ Ні", callback_data="resetno:0")
     ]])
 
     await q.edit_message_text(
-        f"⚠️ Точно видалити ВСІ дані "
-        f"{child['name']} за {month_key()}?\n\n"
-        f"Буде видалено навчання, досягнення "
-        f"та всі підтвердження.\n"
-        f"Після цього він зможе заповнити місяць заново.",
+        f"⚠️ Скинути активні дані {child['name']} за {month_key()}?\n\n"
+        "Перед скиданням бот збереже архівну копію навчання, "
+        "досягнень і правил розрахунку.",
         reply_markup=kb
     )
 
@@ -1507,54 +1983,75 @@ async def reset_ask_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     u = get_user(q.from_user.id)
-
     if not u or u["role"] != "admin":
         return
 
     action, value = q.data.split(":")
-
     if action == "resetno":
-        await q.edit_message_text(
-            "Скидання скасовано."
-        )
+        await q.edit_message_text("Скидання скасовано.")
         return
 
     tg = int(value)
     child = get_user(tg)
-
     if not child:
         return
-
     m = month_key()
 
     c = db()
+    entry_rows = c.execute("""
+        SELECT * FROM entries WHERE tg_id=? AND month=? ORDER BY id
+    """, (tg, m)).fetchall()
 
-    c.execute(
-        "DELETE FROM subjects WHERE tg_id=? AND month=?",
-        (tg, m)
-    )
+    for r in entry_rows:
+        c.execute("""
+            INSERT INTO archived_entries(
+                original_entry_id,tg_id,month,category,description,amount,status
+            ) VALUES(?,?,?,?,?,?,?)
+        """, (
+            r["id"], r["tg_id"], r["month"], r["category"],
+            r["description"], r["amount"], r["status"]
+        ))
+        snaps = c.execute("""
+            SELECT * FROM study_snapshots WHERE entry_id=?
+        """, (r["id"],)).fetchall()
+        for snap in snaps:
+            c.execute("""
+                INSERT INTO archived_study_snapshots(
+                    original_entry_id,tg_id,month,subject_id,subject_name,
+                    avg,calculated_amount,pricing_snapshot
+                ) VALUES(?,?,?,?,?,?,?,?)
+            """, (
+                r["id"], tg, m, snap["subject_id"], snap["subject_name"],
+                snap["avg"], snap["calculated_amount"], snap["pricing_snapshot"]
+            ))
+        c.execute("DELETE FROM study_snapshots WHERE entry_id=?", (r["id"],))
 
-    c.execute(
-        "DELETE FROM entries WHERE tg_id=? AND month=?",
-        (tg, m)
-    )
+    subj_rows = c.execute("""
+        SELECT * FROM subjects WHERE tg_id=? AND month=?
+    """, (tg, m)).fetchall()
+    for r in subj_rows:
+        c.execute("""
+            INSERT INTO archived_subjects(tg_id,month,subject,avg)
+            VALUES(?,?,?,?)
+        """, (r["tg_id"], r["month"], r["subject"], r["avg"]))
 
+    c.execute("DELETE FROM subjects WHERE tg_id=? AND month=?", (tg, m))
+    c.execute("DELETE FROM entries WHERE tg_id=? AND month=?", (tg, m))
     c.commit()
     c.close()
 
     await q.edit_message_text(
-        f"🗑 {child['name']}: місяць {m} "
-        f"повністю скинуто.\n"
-        f"Тепер можна заповнювати заново."
+        f"🗑 {child['name']}: місяць {m} скинуто.\n"
+        "📚 Попередню версію збережено в історії.\n"
+        "Тепер можна заповнювати заново."
     )
 
     try:
         await context.bot.send_message(
             tg,
-            f"🔄 Андрій скинув твої дані за {m}.\n"
-            f"Можеш заповнити місяць заново.",
+            f"🔄 Андрій скинув твої активні дані за {m}.\n"
+            "Можеш заповнити місяць заново.",
             reply_markup=MENU_CHILD
         )
     except Exception:
@@ -1665,13 +2162,13 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "База — 2 000 грн/міс.\n"
         "Бонусний фонд — до 4 000 грн.\n"
         "Максимум — 6 000 грн.\n\n"
-        "📚 Навчання: середній бал рахується "
-        "окремо по кожному предмету; бонус — до 1 500 грн.\n\n"
-        "Інші напрямки: спорт, книги, допомога, "
-        "саморозвиток.\n\n"
-        "До підтвердження Андрієм запис можна "
-        "змінити або видалити.\n"
+        "📚 Навчання: Андрій сам задає активні предмети та шкалу винагороди.\n"
+        "Після підтвердження сума, оцінки й правила цього місяця фіксуються "
+        "та не змінюються від майбутніх налаштувань.\n\n"
+        "Інші напрямки: спорт, книги, допомога, саморозвиток.\n\n"
+        "До підтвердження Андрієм запис можна змінити або видалити.\n"
         "Після підтвердження запис блокується 🔒.\n\n"
+        "💬 Приватні повідомлення Влада і Ромчика зберігаються окремо.\n\n"
         "Гроші:\n"
         "70% особисті витрати\n"
         "20% накопичення\n"
@@ -1680,13 +2177,17 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Якщо хлопець зараз редагує опис
+    t = (update.message.text or "").strip()
+
+    if context.user_data.get("chat_mode"):
+        handled = await chat_text(update, context)
+        if handled:
+            return
+
     if context.user_data.get("edit_eid"):
         handled = await edit_text(update, context)
         if handled:
             return
-
-    t = (update.message.text or "").strip()
 
     if t == "📊 Мій підсумок":
         return await my_summary(update, context)
@@ -1694,10 +2195,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "✏️ Мої записи":
         return await my_entries(update, context)
 
-    if t in (
-        "👥 Звіти Влада і Ромчика",
-        "📊 Підсумок місяця"
-    ):
+    if t == "💬 Андрію":
+        return await child_chat_start(update, context)
+
+    if t in ("👥 Звіти Влада і Ромчика", "📊 Підсумок місяця"):
         return await admin_reports(update, context)
 
     if t == "✅ На підтвердження":
@@ -1705,6 +2206,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if t == "🗑 Скинути місяць":
         return await reset_month_start(update, context)
+
+    if t == "⚙️ Навчання":
+        return await study_settings(update, context)
+
+    if t == "💬 Повідомлення":
+        return await admin_chat_start(update, context)
+
+    if t == "📚 Історія":
+        return await history_help(update, context)
 
     if t == "❓ Правила":
         return await rules(update, context)
@@ -1724,137 +2234,62 @@ def main():
     app.add_handler(CommandHandler("join", join))
     app.add_handler(CommandHandler("sum", set_sum))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("subjectadd", subject_add_cmd))
+    app.add_handler(CommandHandler("subjectrename", subject_rename_cmd))
+    app.add_handler(CommandHandler("price", price_cmd))
+    app.add_handler(CommandHandler("pricedel", price_del_cmd))
+    app.add_handler(CommandHandler("month", month_cmd))
 
-    app.add_handler(
-        CallbackQueryHandler(
-            join_cb,
-            pattern=r"^join(ok|no):"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            amount_cb,
-            pattern=r"^amt:"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            custom_cb,
-            pattern=r"^custom:"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            study_cb,
-            pattern=r"^study(ok|no):"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            edit_cb,
-            pattern=r"^edit:"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            delete_ask_cb,
-            pattern=r"^deleteask:"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            delete_confirm_cb,
-            pattern=r"^delete(yes|no):"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            reset_ask_cb,
-            pattern=r"^resetask:"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            reset_confirm_cb,
-            pattern=r"^reset(yes|no):"
-        )
-    )
+    app.add_handler(CallbackQueryHandler(join_cb, pattern=r"^join(ok|no):"))
+    app.add_handler(CallbackQueryHandler(amount_cb, pattern=r"^amt:"))
+    app.add_handler(CallbackQueryHandler(custom_cb, pattern=r"^custom:"))
+    app.add_handler(CallbackQueryHandler(study_cb, pattern=r"^study(ok|no):"))
+    app.add_handler(CallbackQueryHandler(edit_cb, pattern=r"^edit:"))
+    app.add_handler(CallbackQueryHandler(delete_ask_cb, pattern=r"^deleteask:"))
+    app.add_handler(CallbackQueryHandler(delete_confirm_cb, pattern=r"^delete(yes|no):"))
+    app.add_handler(CallbackQueryHandler(reset_ask_cb, pattern=r"^resetask:"))
+    app.add_handler(CallbackQueryHandler(reset_confirm_cb, pattern=r"^reset(yes|no):"))
+    app.add_handler(CallbackQueryHandler(subject_toggle_cb, pattern=r"^subtoggle:"))
+    app.add_handler(CallbackQueryHandler(chat_pick_cb, pattern=r"^chatpick:"))
 
     app.add_handler(
         ConversationHandler(
             entry_points=[
-                MessageHandler(
-                    filters.Regex(r"^📝 Підсумки місяця$"),
-                    report_start
-                )
+                MessageHandler(filters.Regex(r"^📝 Підсумки місяця$"), report_start)
             ],
             states={
-                SUBJECT: [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND,
-                        subject
-                    )
-                ],
-                AVG: [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND,
-                        avg
-                    )
+                STUDY_GRADE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, avg)
                 ]
             },
-            fallbacks=[
-                CommandHandler("cancel", cancel)
-            ]
+            fallbacks=[CommandHandler("cancel", cancel)]
         )
     )
 
     app.add_handler(
         ConversationHandler(
             entry_points=[
-                MessageHandler(
-                    filters.Regex(r"^➕ Додати досягнення$"),
-                    add_start
-                )
+                MessageHandler(filters.Regex(r"^➕ Додати досягнення$"), add_start)
             ],
             states={
                 CAT: [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND,
-                        cat
-                    )
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, cat)
                 ],
                 DESC: [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND,
-                        desc
-                    )
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, desc)
                 ]
             },
-            fallbacks=[
-                CommandHandler("cancel", cancel)
-            ]
+            fallbacks=[CommandHandler("cancel", cancel)]
         )
     )
 
     app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_router
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_router)
     )
 
-    app.run_polling(
-        drop_pending_updates=True
-    )
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
+
