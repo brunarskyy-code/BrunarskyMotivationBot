@@ -39,6 +39,31 @@ CATS = {
     "development": ("Саморозвиток", 700),
 }
 
+# Ставки за навчання можна змінювати з адмін-меню.
+# Пороги нижче — стартові значення; у БД вони зберігаються окремо.
+DEFAULT_STUDY_RATES = {
+    12: [
+        (11.0, 1500),
+        (10.5, 1200),
+        (10.0, 1000),
+        (9.5, 700),
+        (8.0, 500),
+        (7.0, 300),
+        (6.0, 150),
+        (0.0, 0),
+    ],
+    6: [
+        (5.5, 1500),
+        (5.25, 1200),
+        (5.0, 1000),
+        (4.75, 700),
+        (4.0, 500),
+        (3.5, 300),
+        (3.0, 150),
+        (0.0, 0),
+    ],
+}
+
 MENU_CHILD = ReplyKeyboardMarkup([
     ["📝 Заповнити / змінити", "📋 Переглянути місяць"],
     ["📤 Відправити Андрію", "📊 Мій підсумок"],
@@ -48,7 +73,7 @@ MENU_CHILD = ReplyKeyboardMarkup([
 MENU_ADMIN = ReplyKeyboardMarkup([
     ["👥 Звіти дітей", "✅ На підтвердження"],
     ["♻️ Керування місяцем", "📊 Підсумок місяця"],
-    ["❓ Правила"]
+    ["⚙️ Ставки навчання", "❓ Правила"]
 ], resize_keyboard=True)
 
 MENU_EDIT = ReplyKeyboardMarkup([
@@ -87,6 +112,17 @@ def db():
         month TEXT NOT NULL,
         snapshot TEXT NOT NULL,
         archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS study_rates(
+        scale INTEGER NOT NULL,
+        min_avg REAL NOT NULL,
+        amount INTEGER NOT NULL,
+        PRIMARY KEY(scale,min_avg))""")
+    for _scale, _rates in DEFAULT_STUDY_RATES.items():
+        for _min_avg, _amount in _rates:
+            c.execute(
+                "INSERT OR IGNORE INTO study_rates(scale,min_avg,amount) VALUES(?,?,?)",
+                (_scale,_min_avg,_amount)
+            )
     # Migration from older bot versions.
     cols = [r["name"] for r in c.execute("PRAGMA table_info(entries)").fetchall()]
     if "status" not in cols:
@@ -147,18 +183,34 @@ def grade_system_label(tg_id):
     m=grade_max_for_child(tg_id)
     return "6-бальна" if m==6 else "12-бальна"
 
+def get_study_rates(scale):
+    c=db()
+    rows=c.execute(
+        "SELECT min_avg,amount FROM study_rates WHERE scale=? ORDER BY min_avg DESC",
+        (int(scale),)
+    ).fetchall()
+    c.close()
+    return [(float(r["min_avg"]), int(r["amount"])) for r in rows]
+
+def study_rates_text(scale=None):
+    scales=[int(scale)] if scale else [12,6]
+    blocks=[]
+    for sc in scales:
+        rows=get_study_rates(sc)
+        lines=[f"🎓 {sc}-бальна система:"]
+        for threshold,amount in rows:
+            if threshold<=0:
+                lines.append(f"• нижче мінімального порога → {amount} грн")
+            else:
+                lines.append(f"• від {threshold:g} → {amount} грн")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
 def study_level(tg_id, avg):
-    # Окремі, але співмірні шкали.
-    if grade_max_for_child(tg_id)==6:
-        if avg >= 5.5: return 1500
-        if avg >= 5.25: return 1200
-        if avg >= 5.0: return 1000
-        if avg >= 4.75: return 700
-        return 0
-    if avg >= 11: return 1500
-    if avg >= 10.5: return 1200
-    if avg >= 10: return 1000
-    if avg >= 9.5: return 700
+    scale=int(grade_max_for_child(tg_id))
+    for threshold,amount in get_study_rates(scale):
+        if avg >= threshold:
+            return min(STUDY_CAP,max(0,int(amount)))
     return 0
 
 def calc_study(tg_id, month):
@@ -693,6 +745,87 @@ async def my_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"70% особисті: {round(t*.7)} грн\n20% накопичення: {round(t*.2)} грн\n10% добрі справи: {round(t*.1)} грн"
     )
 
+async def study_rates_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin":
+        await update.message.reply_text("Спочатку авторизуйся як адміністратор."); return
+    kb=InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ 12-бальна",callback_data="ratescale:12"),
+        InlineKeyboardButton("✏️ 6-бальна",callback_data="ratescale:6")
+    ]])
+    await update.message.reply_text(
+        "⚙️ Поточні ставки за навчання\n\n"+study_rates_text()+
+        f"\n\nМаксимум за навчання: {STUDY_CAP} грн.",
+        reply_markup=kb
+    )
+
+async def ratescale_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    scale=int(q.data.split(":")[1])
+    rows=get_study_rates(scale)
+    buttons=[]
+    for threshold,amount in rows:
+        if threshold<=0:
+            label=f"Нижче порога → {amount} грн"
+        else:
+            label=f"≥ {threshold:g} → {amount} грн"
+        buttons.append([InlineKeyboardButton(label,callback_data=f"rateedit:{scale}:{threshold:g}")])
+    await q.message.reply_text(
+        f"✏️ {scale}-бальна система\nНатисни ставку, яку хочеш змінити.",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def rateedit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    _,scale,threshold=q.data.split(":",2)
+    scale=int(scale); threshold=float(threshold)
+    c=db()
+    row=c.execute(
+        "SELECT amount FROM study_rates WHERE scale=? AND min_avg=?",
+        (scale,threshold)
+    ).fetchone()
+    c.close()
+    if not row:
+        await q.message.reply_text("Ставку не знайдено."); return
+    context.user_data["study_rate_edit"]=(scale,threshold)
+    await q.message.reply_text(
+        f"Введи нову суму для {scale}-бальної системи, поріг {threshold:g}.\n"
+        f"Зараз: {row['amount']} грн. Максимум: {STUDY_CAP} грн.\n"
+        "Просто надішли число, наприклад 450."
+    )
+
+async def save_study_rate_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    edit=context.user_data.get("study_rate_edit")
+    if not edit: return False
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin":
+        context.user_data.pop("study_rate_edit",None); return False
+    t=(update.message.text or "").strip().replace(" ","")
+    try:
+        amount=int(t)
+    except ValueError:
+        await update.message.reply_text("Введи лише суму числом, наприклад 450.")
+        return True
+    amount=max(0,min(amount,STUDY_CAP))
+    scale,threshold=edit
+    c=db()
+    c.execute(
+        "UPDATE study_rates SET amount=? WHERE scale=? AND min_avg=?",
+        (amount,scale,threshold)
+    )
+    c.commit(); c.close()
+    context.user_data.pop("study_rate_edit",None)
+    await update.message.reply_text(
+        f"✅ Ставку змінено: {scale}-бальна, від {threshold:g} → {amount} грн.\n\n"
+        + study_rates_text(scale),
+        reply_markup=MENU_ADMIN
+    )
+    return True
+
 async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u=get_user(update.effective_user.id)
     if not u or u["role"]!="admin":
@@ -707,9 +840,9 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "База — 2 000 грн/міс. Бонусний фонд — до 4 000 грн. Максимум — 6 000 грн.\n"
         "Навчання: Влад — 12-бальна система, Ромчик — 6-бальна. Кожен сам пише назву предмета й середню оцінку.\n"
-        "Бонус за навчання бот рахує автоматично, максимум 1 500 грн.\n"
-        "Еквівалентні пороги: Влад 9,5/10/10,5/11; Ромчик 4,75/5/5,25/5,5.\n"
-        "Інші напрямки: спорт, книги, допомога, саморозвиток.\n\n"
+        f"Бонус за навчання бот рахує автоматично, максимум {STUDY_CAP} грн.\n\n"
+        + study_rates_text() +
+        "\n\nІнші напрямки: спорт, книги, допомога, саморозвиток.\n\n"
         "📝 Поки місяць у чернетці — можна змінювати й видаляти.\n"
         "📤 Після відправлення Андрію редагування блокується.\n"
         "↩️ Андрій може повернути на виправлення.\n"
@@ -719,6 +852,9 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("study_rate_edit"):
+        if await save_study_rate_text(update,context): return
+
     # If child is currently editing one achievement, next text is the replacement.
     if context.user_data.get("edit_eid"):
         if await save_edit_text(update,context): return
@@ -744,6 +880,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if t in ("👥 Звіти дітей","👥 Звіти Влада і Ромчика","📊 Підсумок місяця"): return await admin_reports(update,context)
         if t=="✅ На підтвердження": return await pending_admin(update,context)
         if t=="♻️ Керування місяцем": return await reset_menu(update,context)
+        if t=="⚙️ Ставки навчання": return await study_rates_menu(update,context)
 
 async def error_handler(update, context):
     print("ERROR:",repr(context.error))
@@ -769,6 +906,8 @@ def main():
     app.add_handler(CallbackQueryHandler(month_admin_cb,pattern=r"^month(ok|back):"))
     app.add_handler(CallbackQueryHandler(resetask_cb,pattern=r"^resetask:"))
     app.add_handler(CallbackQueryHandler(reset_cb,pattern=r"^reset(ok|no):"))
+    app.add_handler(CallbackQueryHandler(ratescale_cb,pattern=r"^ratescale:"))
+    app.add_handler(CallbackQueryHandler(rateedit_cb,pattern=r"^rateedit:"))
 
     app.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📚 Навчання$"),report_start)],
