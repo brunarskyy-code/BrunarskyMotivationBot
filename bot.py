@@ -321,6 +321,63 @@ def summary(tg_id, month):
     bonus=min(bonus_cap,study+other)
     return study,other,bonus,min(get_total_cap(),base+bonus)
 
+def achievement_total(tg_id, month):
+    c=db()
+    r=c.execute(
+        """SELECT COALESCE(SUM(amount),0) s FROM entries
+           WHERE tg_id=? AND month=? AND category!='study'""",
+        (tg_id,month)
+    ).fetchone()
+    c.close()
+    return int(r["s"])
+
+def projected_summary(tg_id, month):
+    """Current calculation for admin, even before final approval."""
+    study=calc_study(tg_id,month)
+    other=achievement_total(tg_id,month)
+    base=get_base_amount()
+    bonus=min(get_bonus_cap(),study+other)
+    total=min(get_total_cap(),base+bonus)
+    return study,other,bonus,total
+
+def admin_detailed_text(tg_id, month):
+    u=get_user(tg_id)
+    st=month_status(tg_id,month)
+    study,other,bonus,total=projected_summary(tg_id,month)
+    text=month_text(tg_id,month)
+    label="Підтверджено" if st=="approved" else "Попередній розрахунок"
+    return (
+        text+
+        "\n\n💵 Фінанси:\n"
+        f"• База: {get_base_amount()} грн\n"
+        f"• Навчання: {study} грн\n"
+        f"• Досягнення: {other} грн\n"
+        f"• Бонуси після загального ліміту: {bonus} грн\n"
+        f"💰 {label}: {total} грн\n"
+        f"  70% особисті: {round(total*.7)} грн\n"
+        f"  20% накопичення: {round(total*.2)} грн\n"
+        f"  10% добрі справи: {round(total*.1)} грн"
+    )
+
+def admin_short_child_text(tg_id, month):
+    u=get_user(tg_id)
+    st=month_status(tg_id,month)
+    study,other,bonus,total=projected_summary(tg_id,month)
+    lines=[
+        f"👤 {u['name'] if u else tg_id}",
+        f"🎓 Навчання: {study} грн",
+        f"🏆 Досягнення: {other} грн",
+        f"💵 База: {get_base_amount()} грн",
+    ]
+    if st=="approved":
+        lines.append(f"💳 ДО ПЕРЕКАЗУ: {total} грн")
+        lines.append(
+            f"70%: {round(total*.7)} · 20%: {round(total*.2)} · 10%: {round(total*.1)} грн"
+        )
+    else:
+        lines.append(f"⏳ Ще не підтверджено · після підтвердження: {total} грн")
+    return "\n".join(lines), (total if st=="approved" else 0)
+
 def status_label(s):
     return {"draft":"📝 Чернетка","submitted":"⏳ Надіслано Андрію","approved":"🔒 Підтверджено"}.get(s,s)
 
@@ -1288,6 +1345,7 @@ async def save_study_rate_text(update: Update, context: ContextTypes.DEFAULT_TYP
     return True
 
 async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Розширений звіт: предмети, оцінки, досягнення і повний фінансовий розрахунок."""
     u=get_user(update.effective_user.id)
     if not u or u["role"]!="admin":
         await update.message.reply_text("Спочатку авторизуйся як адміністратор."); return
@@ -1295,7 +1353,32 @@ async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not kids:
         await update.message.reply_text("Хлопці ще не підключені."); return
     m=month_key()
-    await update.message.reply_text("\n\n".join(month_text(k["tg_id"],m) for k in kids))
+    await update.message.reply_text(f"👥 Розширені звіти за {m}")
+    for k in kids:
+        await update.message.reply_text(admin_detailed_text(k["tg_id"],m))
+
+async def admin_month_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Коротко: скільки фактично переказати кожній дитині."""
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin":
+        await update.message.reply_text("Спочатку авторизуйся як адміністратор."); return
+    c=db(); kids=c.execute("SELECT * FROM users WHERE role='child' ORDER BY name").fetchall(); c.close()
+    if not kids:
+        await update.message.reply_text("Хлопці ще не підключені."); return
+
+    m=month_key()
+    parts=[f"📊 Підсумок за {m}"]
+    grand_total=0
+    for k in kids:
+        block,payable=admin_short_child_text(k["tg_id"],m)
+        if k["name"]=="Тест":
+            block+="\n🧪 Тестовий акаунт — у загальну суму не додаю."
+            payable=0
+        parts.append(block)
+        grand_total+=payable
+
+    parts.append(f"💳 РАЗОМ ДО ПЕРЕКАЗУ: {grand_total} грн")
+    await update.message.reply_text("\n\n".join(parts))
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1347,7 +1430,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Головне меню.",reply_markup=MENU_CHILD); return
 
     if u and u["role"]=="admin":
-        if t in ("👥 Звіти дітей","👥 Звіти Влада і Ромчика","📊 Підсумок місяця"): return await admin_reports(update,context)
+        if t in ("👥 Звіти дітей","👥 Звіти Влада і Ромчика"): return await admin_reports(update,context)
+        if t=="📊 Підсумок місяця": return await admin_month_summary(update,context)
         if t=="✅ На підтвердження": return await pending_admin(update,context)
         if t=="♻️ Керування місяцем": return await reset_menu(update,context)
         if t in ("⚙️ Суми та ставки","⚙️ Ставки навчання"): return await money_settings_menu(update,context)
