@@ -1,5 +1,6 @@
 import os, sqlite3, sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -155,8 +156,22 @@ def db():
     c.commit()
     return c
 
+def local_now():
+    try:
+        return datetime.now(ZoneInfo("Europe/Kyiv"))
+    except Exception:
+        # Safe fallback for Railway images without timezone data.
+        return datetime.now(timezone(timedelta(hours=2)))
+
+def calendar_month_key():
+    return local_now().strftime("%Y-%m")
+
 def month_key():
-    return datetime.now().strftime("%Y-%m")
+    """Accounting period: children fill in the previous calendar month."""
+    now=local_now()
+    first_this_month=now.replace(day=1)
+    previous_month=first_this_month - timedelta(days=1)
+    return previous_month.strftime("%Y-%m")
 
 def register(tg_id, role, name):
     c=db()
@@ -535,6 +550,7 @@ async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb=ReplyKeyboardMarkup([["ГОТОВО"],["⬅️ Назад"]],resize_keyboard=True)
     await update.message.reply_text(
+        f"📅 Заповнюємо обліковий період {month_key()} — попередній календарний місяць.\n"
         f"📚 Твоя система оцінювання — {int(grade_max_for_child(tg))}-бальна.\n"
         "Поки збережених предметів немає. Введи назву першого предмета.\n"
         "Після цього бот попросить середній бал.\n"
@@ -796,7 +812,7 @@ async def clear_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🧹 Так, очистити",callback_data="clearok"),
         InlineKeyboardButton("Ні",callback_data="clearno")
     ]])
-    await update.message.reply_text("Очистити ВСІ твої дані за поточний місяць і почати заново?",reply_markup=kb)
+    await update.message.reply_text(f"Очистити ВСІ твої дані за обліковий період {month_key()} і почати заново?",reply_markup=kb)
 
 async def clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
@@ -966,7 +982,7 @@ async def reset_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not kids:
         await update.message.reply_text("Хлопці ще не підключені."); return
     kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"♻️ {k['name']} — {month_key()}",callback_data=f"resetask:{k['tg_id']}:{month_key()}")] for k in kids])
-    await update.message.reply_text("Чий поточний місяць скинути? Попередня версія залишиться в архіві.",reply_markup=kb)
+    await update.message.reply_text(f"Чий обліковий період {month_key()} скинути? Попередня версія залишиться в архіві.",reply_markup=kb)
 
 async def resetask_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
@@ -1283,6 +1299,7 @@ async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
+        f"Обліковий період — попередній календарний місяць: у жовтні заповнюється вересень, у листопаді — жовтень.\n"
         f"База — {get_base_amount()} грн/міс. Бонусний фонд — до {get_bonus_cap()} грн. Максимум — {get_total_cap()} грн.\n"
         "Навчання: Влад — 12-бальна система, Ромчик — 6-бальна. Кожен сам пише назву предмета й середню оцінку.\n"
         f"Бонус за навчання бот рахує автоматично, максимум {get_study_cap()} грн.\n"
