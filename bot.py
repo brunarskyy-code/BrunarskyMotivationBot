@@ -8,7 +8,12 @@ from telegram.ext import (
 
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
-ADMIN_TG_ID = int(os.environ.get("ADMIN_TG_ID", "0") or 0)
+_admin_tg_id_raw = (os.environ.get("ADMIN_TG_ID", "0") or "0").strip()
+try:
+    ADMIN_TG_ID = int(_admin_tg_id_raw)
+except ValueError:
+    ADMIN_TG_ID = 0
+    print("WARNING: ADMIN_TG_ID must be numeric; starting without auto-admin registration.")
 DB = os.environ.get("DB_PATH", "motivation.db")
 
 BASE = 2000
