@@ -29,7 +29,7 @@ MENU_CHILD = ReplyKeyboardMarkup([
 ], resize_keyboard=True)
 
 MENU_ADMIN = ReplyKeyboardMarkup([
-    ["👥 Звіти Влада і Ромчика", "✅ На підтвердження"],
+    ["👥 Звіти дітей", "✅ На підтвердження"],
     ["♻️ Керування місяцем", "📊 Підсумок місяця"],
     ["❓ Правила"]
 ], resize_keyboard=True)
@@ -219,8 +219,8 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Андрій зареєстрований як адміністратор.",reply_markup=MENU_ADMIN)
 
 async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0] not in ("Влад","Ромчик"):
-        await update.message.reply_text("Напиши /join Влад або /join Ромчик"); return
+    if not context.args or context.args[0] not in ("Влад","Ромчик","Тест"):
+        await update.message.reply_text("Напиши /join Влад, /join Ромчик або /join Тест"); return
     name=context.args[0]; aid=admin_id()
     if not aid:
         await update.message.reply_text("Спочатку Андрій має зареєструватися."); return
@@ -704,7 +704,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Головне меню.",reply_markup=MENU_CHILD); return
 
     if u and u["role"]=="admin":
-        if t in ("👥 Звіти Влада і Ромчика","📊 Підсумок місяця"): return await admin_reports(update,context)
+        if t in ("👥 Звіти дітей","👥 Звіти Влада і Ромчика","📊 Підсумок місяця"): return await admin_reports(update,context)
         if t=="✅ На підтвердження": return await pending_admin(update,context)
         if t=="♻️ Керування місяцем": return await reset_menu(update,context)
 
