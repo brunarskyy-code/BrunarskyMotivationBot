@@ -73,7 +73,7 @@ MENU_CHILD = ReplyKeyboardMarkup([
 MENU_ADMIN = ReplyKeyboardMarkup([
     ["👥 Звіти дітей", "✅ На підтвердження"],
     ["♻️ Керування місяцем", "📊 Підсумок місяця"],
-    ["⚙️ Ставки навчання", "❓ Правила"]
+    ["⚙️ Суми та ставки", "❓ Правила"]
 ], resize_keyboard=True)
 
 MENU_EDIT = ReplyKeyboardMarkup([
@@ -120,10 +120,19 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS app_settings(
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL)""")
-    c.execute(
-        "INSERT OR IGNORE INTO app_settings(key,value) VALUES('study_cap',?)",
-        (str(STUDY_CAP),)
-    )
+    for _key,_value in {
+        "study_cap": STUDY_CAP,
+        "base_amount": BASE,
+        "total_cap": BASE + BONUS_CAP,
+        "cat_sport_cap": CATS["sport"][1],
+        "cat_books_cap": CATS["books"][1],
+        "cat_help_cap": CATS["help"][1],
+        "cat_development_cap": CATS["development"][1],
+    }.items():
+        c.execute(
+            "INSERT OR IGNORE INTO app_settings(key,value) VALUES(?,?)",
+            (_key,str(_value))
+        )
     for _scale, _rates in DEFAULT_STUDY_RATES.items():
         for _min_avg, _amount in _rates:
             c.execute(
@@ -190,25 +199,45 @@ def grade_system_label(tg_id):
     m=grade_max_for_child(tg_id)
     return "6-бальна" if m==6 else "12-бальна"
 
-def get_study_cap():
+def get_setting_int(key, default):
     c=db()
-    r=c.execute("SELECT value FROM app_settings WHERE key='study_cap'").fetchone()
+    r=c.execute("SELECT value FROM app_settings WHERE key=?",(key,)).fetchone()
     c.close()
     try:
-        return max(0,int(r["value"])) if r else STUDY_CAP
+        return max(0,int(r["value"])) if r else int(default)
     except (ValueError,TypeError):
-        return STUDY_CAP
+        return int(default)
 
-def set_study_cap(amount):
+def set_setting_int(key, amount):
     amount=max(0,int(amount))
     c=db()
     c.execute(
-        """INSERT INTO app_settings(key,value) VALUES('study_cap',?)
+        """INSERT INTO app_settings(key,value) VALUES(?,?)
            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-        (str(amount),)
+        (key,str(amount))
     )
     c.commit(); c.close()
     return amount
+
+def get_base_amount():
+    return get_setting_int("base_amount", BASE)
+
+def get_total_cap():
+    return get_setting_int("total_cap", BASE + BONUS_CAP)
+
+def get_bonus_cap():
+    return max(0, get_total_cap() - get_base_amount())
+
+def get_study_cap():
+    return get_setting_int("study_cap", STUDY_CAP)
+
+def set_study_cap(amount):
+    return set_setting_int("study_cap", amount)
+
+def get_category_cap(category):
+    default=CATS.get(category,("",0))[1]
+    return get_setting_int(f"cat_{category}_cap", default)
+
 
 def get_study_rates(scale):
     c=db()
@@ -255,8 +284,10 @@ def summary(tg_id, month):
     st = month_status(tg_id,month)
     study = calc_study(tg_id,month) if st=="approved" else 0
     other = approved_bonus(tg_id,month)
-    bonus=min(BONUS_CAP,study+other)
-    return study,other,bonus,BASE+bonus
+    base=get_base_amount()
+    bonus_cap=get_bonus_cap()
+    bonus=min(bonus_cap,study+other)
+    return study,other,bonus,min(get_total_cap(),base+bonus)
 
 def status_label(s):
     return {"draft":"📝 Чернетка","submitted":"⏳ Надіслано Андрію","approved":"🔒 Підтверджено"}.get(s,s)
@@ -576,7 +607,7 @@ async def amount_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.close(); await q.answer("Запис не знайдено.",show_alert=True); return
     if row["category"] not in CATS:
         c.close(); return
-    maxv=CATS[row["category"]][1]
+    maxv=get_category_cap(row["category"])
     amt=max(0,min(amt,maxv))
     c.execute("UPDATE entries SET amount=? WHERE id=?",(amt,eid)); c.commit(); c.close()
     await q.edit_message_text(q.message.text+f"\n\n💰 Сума: {amt} грн")
@@ -612,7 +643,7 @@ async def send_achievement_amount_controls(context, tg, month, aid):
     child=get_user(tg)
     for r in rows:
         label=CATS.get(r["category"],(r["category"],0))[0]
-        maxv=CATS.get(r["category"],("",0))[1]
+        maxv=get_category_cap(r["category"])
         await context.bot.send_message(
             aid,
             f"🏆 {child['name']}: {label}\n{r['description']}\nПоточна сума: {r['amount']} грн · максимум {maxv} грн",
@@ -767,9 +798,132 @@ async def my_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st=month_status(u["tg_id"],m)
     await update.message.reply_text(
         f"📊 {u['name']} — {m}\n{status_label(st)}\n"
-        f"База: {BASE} грн\nНавчання підтверджено: {s} грн\nІнші підтверджені: {o} грн\n"
-        f"Бонуси разом (до {BONUS_CAP}): {b} грн\n\n💰 Разом: {t} грн\n"
+        f"База: {get_base_amount()} грн\nНавчання підтверджено: {s} грн\nІнші підтверджені: {o} грн\n"
+        f"Бонуси разом (до {get_bonus_cap()}): {b} грн\n\n💰 Разом: {t} грн (макс. {get_total_cap()})\n"
         f"70% особисті: {round(t*.7)} грн\n20% накопичення: {round(t*.2)} грн\n10% добрі справи: {round(t*.1)} грн"
+    )
+
+MONEY_SETTING_LABELS = {
+    "base_amount": "💵 База",
+    "total_cap": "💰 Максимум разом",
+    "study_cap": "🎓 Максимум за навчання",
+    "cat_sport_cap": "🏃 Спорт",
+    "cat_books_cap": "📚 Книги",
+    "cat_help_cap": "🏠 Допомога",
+    "cat_development_cap": "🚀 Саморозвиток",
+}
+
+def money_settings_text():
+    base=get_base_amount()
+    total=get_total_cap()
+    bonus=get_bonus_cap()
+    return (
+        "⚙️ Суми та ліміти\n\n"
+        f"💵 База: {base} грн\n"
+        f"🎁 Доступно бонусів: до {bonus} грн\n"
+        f"💰 Максимум разом: {total} грн\n"
+        f"🎓 Максимум за навчання: {get_study_cap()} грн\n"
+        f"🏃 Спорт: до {get_category_cap('sport')} грн\n"
+        f"📚 Книги: до {get_category_cap('books')} грн\n"
+        f"🏠 Допомога: до {get_category_cap('help')} грн\n"
+        f"🚀 Саморозвиток: до {get_category_cap('development')} грн"
+    )
+
+async def money_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin":
+        await update.message.reply_text("Спочатку авторизуйся як адміністратор."); return
+    kb=InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💵 База",callback_data="moneyedit:base_amount"),
+            InlineKeyboardButton("💰 Максимум разом",callback_data="moneyedit:total_cap"),
+        ],
+        [InlineKeyboardButton("🎓 Максимум навчання",callback_data="moneyedit:study_cap")],
+        [
+            InlineKeyboardButton("🏃 Спорт",callback_data="moneyedit:cat_sport_cap"),
+            InlineKeyboardButton("📚 Книги",callback_data="moneyedit:cat_books_cap"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Допомога",callback_data="moneyedit:cat_help_cap"),
+            InlineKeyboardButton("🚀 Саморозвиток",callback_data="moneyedit:cat_development_cap"),
+        ],
+        [InlineKeyboardButton("📈 Пороги оцінок і ставки",callback_data="study_rates_open")]
+    ])
+    await update.message.reply_text(money_settings_text(),reply_markup=kb)
+
+async def moneyedit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    key=q.data.split(":",1)[1]
+    if key not in MONEY_SETTING_LABELS: return
+    defaults={
+        "base_amount":BASE,
+        "total_cap":BASE+BONUS_CAP,
+        "study_cap":STUDY_CAP,
+        "cat_sport_cap":CATS["sport"][1],
+        "cat_books_cap":CATS["books"][1],
+        "cat_help_cap":CATS["help"][1],
+        "cat_development_cap":CATS["development"][1],
+    }
+    current=get_setting_int(key,defaults[key])
+    context.user_data["money_setting_edit"]=key
+    await q.message.reply_text(
+        f"{MONEY_SETTING_LABELS[key]} зараз: {current} грн.\n"
+        "Введи нову суму одним числом."
+    )
+
+async def save_money_setting_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key=context.user_data.get("money_setting_edit")
+    if not key: return False
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin":
+        context.user_data.pop("money_setting_edit",None); return False
+    t=(update.message.text or "").strip().replace(" ","")
+    try:
+        amount=int(t)
+    except ValueError:
+        await update.message.reply_text("Введи лише суму числом.")
+        return True
+    if amount<0:
+        await update.message.reply_text("Сума не може бути від'ємною.")
+        return True
+
+    if key=="total_cap" and amount<get_base_amount():
+        await update.message.reply_text(
+            f"Максимум разом не може бути меншим за базу ({get_base_amount()} грн)."
+        )
+        return True
+
+    set_setting_int(key,amount)
+    context.user_data.pop("money_setting_edit",None)
+    warning=""
+    if key=="study_cap" and amount>get_bonus_cap():
+        warning=(
+            f"\n\n⚠️ Зараз загальний бонусний ліміт — {get_bonus_cap()} грн, "
+            "тому фактично понад нього в загальну суму не потрапить. "
+            "За потреби збільш «💰 Максимум разом»."
+        )
+    await update.message.reply_text(
+        f"✅ {MONEY_SETTING_LABELS[key]}: {amount} грн.\n\n"
+        + money_settings_text() + warning,
+        reply_markup=MENU_ADMIN
+    )
+    return True
+
+async def study_rates_open_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    cap=get_study_cap()
+    kb=InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ 12-бальна",callback_data="ratescale:12"),
+        InlineKeyboardButton("✏️ 6-бальна",callback_data="ratescale:6")
+    ]])
+    await q.message.reply_text(
+        "📈 Пороги оцінок і ставки\n\n"+study_rates_text()+
+        f"\n\nМаксимум за навчання: {cap} грн.",
+        reply_markup=kb
     )
 
 async def study_rates_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -902,7 +1056,7 @@ async def admin_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "База — 2 000 грн/міс. Бонусний фонд — до 4 000 грн. Максимум — 6 000 грн.\n"
+        f"База — {get_base_amount()} грн/міс. Бонусний фонд — до {get_bonus_cap()} грн. Максимум — {get_total_cap()} грн.\n"
         "Навчання: Влад — 12-бальна система, Ромчик — 6-бальна. Кожен сам пише назву предмета й середню оцінку.\n"
         f"Бонус за навчання бот рахує автоматично, максимум {get_study_cap()} грн.\n\n"
         + study_rates_text() +
@@ -916,6 +1070,9 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("money_setting_edit"):
+        if await save_money_setting_text(update,context): return
+
     if context.user_data.get("study_cap_edit"):
         if await save_study_cap_text(update,context): return
 
@@ -947,7 +1104,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if t in ("👥 Звіти дітей","👥 Звіти Влада і Ромчика","📊 Підсумок місяця"): return await admin_reports(update,context)
         if t=="✅ На підтвердження": return await pending_admin(update,context)
         if t=="♻️ Керування місяцем": return await reset_menu(update,context)
-        if t=="⚙️ Ставки навчання": return await study_rates_menu(update,context)
+        if t in ("⚙️ Суми та ставки","⚙️ Ставки навчання"): return await money_settings_menu(update,context)
 
 async def error_handler(update, context):
     print("ERROR:",repr(context.error))
@@ -973,6 +1130,8 @@ def main():
     app.add_handler(CallbackQueryHandler(month_admin_cb,pattern=r"^month(ok|back):"))
     app.add_handler(CallbackQueryHandler(resetask_cb,pattern=r"^resetask:"))
     app.add_handler(CallbackQueryHandler(reset_cb,pattern=r"^reset(ok|no):"))
+    app.add_handler(CallbackQueryHandler(moneyedit_cb,pattern=r"^moneyedit:"))
+    app.add_handler(CallbackQueryHandler(study_rates_open_cb,pattern=r"^study_rates_open$"))
     app.add_handler(CallbackQueryHandler(studycap_cb,pattern=r"^studycap$"))
     app.add_handler(CallbackQueryHandler(ratescale_cb,pattern=r"^ratescale:"))
     app.add_handler(CallbackQueryHandler(rateedit_cb,pattern=r"^rateedit:"))
