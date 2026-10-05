@@ -1,10 +1,15 @@
-import os, sqlite3
+import os, sqlite3, sys
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters
 )
+
+_railway_service = (os.environ.get("RAILWAY_SERVICE_NAME") or "").strip()
+if _railway_service == "BrunarskyMotivationBot":
+    print("Legacy Railway service BrunarskyMotivationBot is intentionally disabled; canonical service is exquisite-growth.")
+    sys.exit(0)
 
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
