@@ -233,7 +233,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Привіт, {u['name']}!",reply_markup=MENU_ADMIN if u["role"]=="admin" else MENU_CHILD)
         return
     await update.message.reply_text(
-        "Привіт! Для реєстрації:\n• Андрій: /admin СЕКРЕТ\n• Влад: /join Влад\n• Ромчик: /join Ромчик"
+        "Привіт! Для реєстрації:\n• Андрій: /admin СЕКРЕТ\n• Влад: /join Влад\n• Ромчик: /join Ромчик\n• Тест: /join Тест"
     )
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,9 +245,20 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Андрій зареєстрований як адміністратор.",reply_markup=MENU_ADMIN)
 
 async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or context.args[0] not in ("Влад","Ромчик","Тест"):
+    raw=(update.message.text or "").strip()
+    parts=raw.split(maxsplit=1)
+    arg=(context.args[0] if context.args else (parts[1] if len(parts)>1 else "")).strip()
+    aliases={
+        "влад":"Влад",
+        "ромчик":"Ромчик",
+        "тест":"Тест",
+        "test":"Тест",
+    }
+    name=aliases.get(arg.casefold())
+    print(f"JOIN_REQUEST tg_id={update.effective_user.id} arg={arg!r} resolved={name!r}")
+    if not name:
         await update.message.reply_text("Напиши /join Влад, /join Ромчик або /join Тест"); return
-    name=context.args[0]; aid=admin_id()
+    aid=admin_id()
     if not aid:
         await update.message.reply_text("Спочатку Андрій має зареєструватися."); return
     kb=InlineKeyboardMarkup([[
@@ -776,6 +787,7 @@ def main():
         fallbacks=[CommandHandler("cancel",cancel)]
     ))
 
+    app.add_handler(MessageHandler(filters.Regex(r"^/join(?:@\\w+)?(?:\\s+.*)?$"),join))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     app.add_error_handler(error_handler)
     app.run_polling(drop_pending_updates=True)
