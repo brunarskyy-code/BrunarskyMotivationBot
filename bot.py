@@ -394,6 +394,41 @@ async def join_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Study draft ----------
 SUBJECT, AVG = range(2)
 
+async def escape_child_wizard_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow menu buttons to escape a half-finished wizard instead of being read as data."""
+    t=(update.message.text or "").strip()
+    main_nav={
+        "📝 Заповнити / змінити",
+        "📋 Переглянути місяць",
+        "📤 Відправити Андрію",
+        "📊 Мій підсумок",
+        "❓ Правила",
+        "⬅️ Назад",
+    }
+    if t not in main_nav:
+        return False
+
+    for key in ("subjects","current_subject","cat"):
+        context.user_data.pop(key,None)
+
+    if t=="📝 Заповнити / змінити":
+        if not await require_child_editable(update):
+            return True
+        await update.message.reply_text("Що хочеш заповнити або змінити?",reply_markup=MENU_EDIT)
+        return True
+    if t=="⬅️ Назад":
+        await update.message.reply_text("Головне меню.",reply_markup=MENU_CHILD)
+        return True
+    if t=="📋 Переглянути місяць":
+        await view_month(update,context); return True
+    if t=="📤 Відправити Андрію":
+        await submit_month(update,context); return True
+    if t=="📊 Мій підсумок":
+        await my_summary(update,context); return True
+    if t=="❓ Правила":
+        await rules(update,context); return True
+    return False
+
 async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_child_editable(update): return ConversationHandler.END
     context.user_data["subjects"]=[]
@@ -409,6 +444,8 @@ async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SUBJECT
 
 async def subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await escape_child_wizard_to_menu(update,context):
+        return ConversationHandler.END
     t=(update.message.text or "").strip()
     if t.upper()=="ГОТОВО":
         items=context.user_data.get("subjects",[])
@@ -437,6 +474,8 @@ async def subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AVG
 
 async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await escape_child_wizard_to_menu(update,context):
+        return ConversationHandler.END
     gmax=grade_max_for_child(update.effective_user.id)
     try: a=float((update.message.text or "").replace(",","."))
     except:
@@ -464,6 +503,8 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CAT
 
 async def cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await escape_child_wizard_to_menu(update,context):
+        return ConversationHandler.END
     mp={"Спорт":"sport","Книги":"books","Допомога":"help","Саморозвиток":"development"}
     t=(update.message.text or "").strip()
     if t=="Скасувати": return await cancel(update,context)
@@ -474,6 +515,8 @@ async def cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return DESC
 
 async def desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await escape_child_wizard_to_menu(update,context):
+        return ConversationHandler.END
     tg=update.effective_user.id; m=month_key()
     if not editable(tg,m):
         await update.message.reply_text("Місяць уже заблокований.",reply_markup=MENU_CHILD)
@@ -1142,7 +1185,8 @@ def main():
             SUBJECT:[MessageHandler(filters.TEXT & ~filters.COMMAND,subject)],
             AVG:[MessageHandler(filters.TEXT & ~filters.COMMAND,avg)]
         },
-        fallbacks=[CommandHandler("cancel",cancel)]
+        fallbacks=[CommandHandler("cancel",cancel)],
+        allow_reentry=True
     ))
     app.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^(➕ Досягнення|➕ Додати досягнення)$"),add_start)],
@@ -1150,7 +1194,8 @@ def main():
             CAT:[MessageHandler(filters.TEXT & ~filters.COMMAND,cat)],
             DESC:[MessageHandler(filters.TEXT & ~filters.COMMAND,desc)]
         },
-        fallbacks=[CommandHandler("cancel",cancel)]
+        fallbacks=[CommandHandler("cancel",cancel)],
+        allow_reentry=True
     ))
 
     app.add_handler(MessageHandler(filters.Regex(r"^/join(?:@\\w+)?(?:\\s+.*)?$"),join))
