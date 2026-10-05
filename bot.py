@@ -99,6 +99,11 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS subjects(
         id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, month TEXT,
         subject TEXT, avg REAL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS subject_catalog(
+        tg_id INTEGER NOT NULL,
+        subject TEXT COLLATE NOCASE NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY(tg_id,subject))""")
     c.execute("""CREATE TABLE IF NOT EXISTS entries(
         id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, month TEXT,
         category TEXT, description TEXT, amount INTEGER DEFAULT 0,
@@ -139,6 +144,10 @@ def db():
                 "INSERT OR IGNORE INTO study_rates(scale,min_avg,amount) VALUES(?,?,?)",
                 (_scale,_min_avg,_amount)
             )
+    c.execute("""INSERT OR IGNORE INTO subject_catalog(tg_id,subject,active)
+                 SELECT DISTINCT tg_id,subject,1
+                 FROM subjects
+                 WHERE TRIM(subject)<>''""")
     # Migration from older bot versions.
     cols = [r["name"] for r in c.execute("PRAGMA table_info(entries)").fetchall()]
     if "status" not in cols:
@@ -270,9 +279,17 @@ def study_level(tg_id, avg):
     return 0
 
 def calc_study(tg_id, month):
-    c=db(); rows=c.execute("SELECT avg FROM subjects WHERE tg_id=? AND month=?",(tg_id,month)).fetchall(); c.close()
+    c=db()
+    rows=c.execute(
+        "SELECT avg FROM subjects WHERE tg_id=? AND month=? AND avg IS NOT NULL",
+        (tg_id,month)
+    ).fetchall()
+    c.close()
     if not rows: return 0
-    return min(get_study_cap(), round(sum(study_level(tg_id,float(r["avg"])) for r in rows)/len(rows)))
+    return min(
+        get_study_cap(),
+        round(sum(study_level(tg_id,float(r["avg"])) for r in rows)/len(rows))
+    )
 
 def approved_bonus(tg_id, month):
     c=db()
@@ -310,7 +327,11 @@ def month_text(tg_id, month):
     ]
     lines.append("📚 Навчання:")
     if subs:
-        lines.extend([f"• {r['subject']}: {r['avg']:g} / {gmax_text}" for r in subs])
+        for r in subs:
+            if r["avg"] is None:
+                lines.append(f"• {r['subject']}: — немає оцінок (не враховується)")
+            else:
+                lines.append(f"• {r['subject']}: {r['avg']:g} / {gmax_text}")
         lines.append(f"💰 Бонус за навчання: {calc_study(tg_id,month)} грн")
     else:
         lines.append("— не заповнено")
@@ -394,6 +415,41 @@ async def join_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Study draft ----------
 SUBJECT, AVG = range(2)
 
+def active_subjects(tg_id):
+    c=db()
+    rows=c.execute(
+        "SELECT subject FROM subject_catalog WHERE tg_id=? AND active=1 ORDER BY subject COLLATE NOCASE",
+        (tg_id,)
+    ).fetchall()
+    c.close()
+    return [r["subject"] for r in rows]
+
+def activate_subject(tg_id, subject):
+    subject=" ".join((subject or "").strip().split())
+    if not subject: return
+    c=db()
+    c.execute(
+        """INSERT INTO subject_catalog(tg_id,subject,active) VALUES(?,?,1)
+           ON CONFLICT(tg_id,subject) DO UPDATE SET active=1""",
+        (tg_id,subject)
+    )
+    c.commit(); c.close()
+
+def deactivate_subject(tg_id, subject):
+    c=db()
+    c.execute(
+        "UPDATE subject_catalog SET active=0 WHERE tg_id=? AND subject=?",
+        (tg_id,subject)
+    )
+    c.commit(); c.close()
+
+def clear_study_context(context):
+    for key in (
+        "subjects","subject_queue","subject_index","current_subject",
+        "current_subject_is_new","cat"
+    ):
+        context.user_data.pop(key,None)
+
 async def escape_child_wizard_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allow menu buttons to escape a half-finished wizard instead of being read as data."""
     t=(update.message.text or "").strip()
@@ -408,8 +464,7 @@ async def escape_child_wizard_to_menu(update: Update, context: ContextTypes.DEFA
     if t not in main_nav:
         return False
 
-    for key in ("subjects","current_subject","cat"):
-        context.user_data.pop(key,None)
+    clear_study_context(context)
 
     if t=="📝 Заповнити / змінити":
         if not await require_child_editable(update):
@@ -429,67 +484,196 @@ async def escape_child_wizard_to_menu(update: Update, context: ContextTypes.DEFA
         await rules(update,context); return True
     return False
 
+async def prompt_next_saved_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    queue=context.user_data.get("subject_queue",[])
+    idx=context.user_data.get("subject_index",0)
+    if idx>=len(queue):
+        context.user_data.pop("current_subject",None)
+        context.user_data.pop("current_subject_is_new",None)
+        kb=ReplyKeyboardMarkup([["ГОТОВО"],["⬅️ Назад"]],resize_keyboard=True)
+        await update.message.reply_text(
+            "✅ Усі збережені предмети пройдено.\n"
+            "Якщо треба — напиши назву НОВОГО предмета.\n"
+            "Якщо більше нічого — натисни ГОТОВО.",
+            reply_markup=kb
+        )
+        return SUBJECT
+
+    subject_name=queue[idx]
+    context.user_data["current_subject"]=subject_name
+    context.user_data["current_subject_is_new"]=False
+    gmax=int(grade_max_for_child(update.effective_user.id))
+    example="5,5" if gmax==6 else "10,7"
+    kb=ReplyKeyboardMarkup([
+        ["🚫 Немає оцінок","🗑 Прибрати предмет"],
+        ["⬅️ Назад"]
+    ],resize_keyboard=True)
+    await update.message.reply_text(
+        f"📚 {subject_name}\n"
+        f"Введи середній бал за місяць (0–{gmax}), наприклад {example}.\n\n"
+        "Якщо цього місяця оцінок не було — натисни «🚫 Немає оцінок».\n"
+        "Такий предмет залишиться на наступний місяць, але зараз у розрахунок НЕ потрапить.",
+        reply_markup=kb
+    )
+    return AVG
+
 async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_child_editable(update): return ConversationHandler.END
-    context.user_data["subjects"]=[]
+    clear_study_context(context)
     tg=update.effective_user.id
-    gmax=int(grade_max_for_child(tg))
+    context.user_data["subjects"]=[]
+    saved=active_subjects(tg)
+    context.user_data["subject_queue"]=saved
+    context.user_data["subject_index"]=0
+
+    if saved:
+        await update.message.reply_text(
+            f"📚 Твоя система оцінювання — {int(grade_max_for_child(tg))}-бальна.\n"
+            "Предмети з минулих періодів уже збережені. Тобі треба лише пройти їх і поставити середній бал."
+        )
+        return await prompt_next_saved_subject(update,context)
+
+    kb=ReplyKeyboardMarkup([["ГОТОВО"],["⬅️ Назад"]],resize_keyboard=True)
     await update.message.reply_text(
-        f"📚 Твоя система оцінювання — {gmax}-бальна.\n"
-        "Введи назву першого предмета.\n"
-        "Потім бот попросить середній бал за місяць.\n"
-        "Коли закінчиш — напиши ГОТОВО.\n"
-        "Для виходу без збереження — /cancel"
+        f"📚 Твоя система оцінювання — {int(grade_max_for_child(tg))}-бальна.\n"
+        "Поки збережених предметів немає. Введи назву першого предмета.\n"
+        "Після цього бот попросить середній бал.\n"
+        "Предмет збережеться і наступного місяця вже буде запропонований автоматично.",
+        reply_markup=kb
     )
     return SUBJECT
+
+async def save_study_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    items=context.user_data.get("subjects",[])
+    m=month_key(); tg=update.effective_user.id
+    if not editable(tg,m):
+        await update.message.reply_text("Місяць уже заблокований.",reply_markup=MENU_CHILD)
+        clear_study_context(context)
+        return ConversationHandler.END
+
+    c=db()
+    c.execute("DELETE FROM subjects WHERE tg_id=? AND month=?",(tg,m))
+    if items:
+        c.executemany(
+            "INSERT INTO subjects(tg_id,month,subject,avg) VALUES(?,?,?,?)",
+            [(tg,m,subject_name,avg_value) for subject_name,avg_value in items]
+        )
+    c.commit(); c.close()
+
+    graded=sum(1 for _,avg_value in items if avg_value is not None)
+    no_grades=sum(1 for _,avg_value in items if avg_value is None)
+    amount=calc_study(tg,m)
+    clear_study_context(context)
+    await update.message.reply_text(
+        f"✅ Навчання збережено в ЧЕРНЕТКУ.\n"
+        f"Предметів з оцінками: {graded}. Без оцінок: {no_grades}.\n"
+        f"Розрахунок: {amount} грн.\n"
+        "Можеш ще змінювати дані. Андрію нічого не надіслано.",
+        reply_markup=MENU_EDIT
+    )
+    return ConversationHandler.END
 
 async def subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await escape_child_wizard_to_menu(update,context):
         return ConversationHandler.END
-    t=(update.message.text or "").strip()
+    t=" ".join((update.message.text or "").strip().split())
     if t.upper()=="ГОТОВО":
-        items=context.user_data.get("subjects",[])
-        if not items:
-            await update.message.reply_text("Поки немає предметів."); return SUBJECT
-        m=month_key(); tg=update.effective_user.id
-        if not editable(tg,m):
-            await update.message.reply_text("Місяць уже заблокований.",reply_markup=MENU_CHILD)
-            return ConversationHandler.END
-        c=db()
-        c.execute("DELETE FROM subjects WHERE tg_id=? AND month=?",(tg,m))
-        c.executemany("INSERT INTO subjects(tg_id,month,subject,avg) VALUES(?,?,?,?)",
-                      [(tg,m,s,a) for s,a in items])
-        c.commit(); c.close()
-        await update.message.reply_text(
-            f"✅ Навчання збережено в ЧЕРНЕТКУ.\nРозрахунок: {calc_study(tg,m)} грн.\n"
-            "Можеш ще змінювати дані. Андрію нічого не надіслано.",
-            reply_markup=MENU_EDIT)
-        return ConversationHandler.END
+        return await save_study_draft(update,context)
     if t in ("Скасувати","⬅️ Назад"):
         return await cancel(update,context)
+    if not t:
+        await update.message.reply_text("Введи назву предмета або натисни ГОТОВО.")
+        return SUBJECT
+
+    existing={name.casefold() for name,_ in context.user_data.get("subjects",[])}
+    if t.casefold() in existing:
+        await update.message.reply_text("Цей предмет уже заповнений. Введи інший або натисни ГОТОВО.")
+        return SUBJECT
+
     context.user_data["current_subject"]=t
+    context.user_data["current_subject_is_new"]=True
     gmax=int(grade_max_for_child(update.effective_user.id))
     example="5,5" if gmax==6 else "10,7"
-    await update.message.reply_text(f"Середній бал з «{t}» за місяць (0–{gmax}). Наприклад: {example}")
+    kb=ReplyKeyboardMarkup([["🚫 Немає оцінок"],["⬅️ Назад"]],resize_keyboard=True)
+    await update.message.reply_text(
+        f"Середній бал з «{t}» за місяць (0–{gmax}), наприклад {example}.\n"
+        "Якщо оцінок цього місяця немає — натисни «🚫 Немає оцінок».",
+        reply_markup=kb
+    )
     return AVG
+
+async def finish_current_subject(update: Update, context: ContextTypes.DEFAULT_TYPE, avg_value):
+    tg=update.effective_user.id
+    subject_name=context.user_data.get("current_subject")
+    is_new=bool(context.user_data.get("current_subject_is_new"))
+    if not subject_name:
+        await update.message.reply_text("Не бачу поточного предмета. Почни «📚 Навчання» заново.",reply_markup=MENU_EDIT)
+        clear_study_context(context)
+        return ConversationHandler.END
+
+    context.user_data.setdefault("subjects",[]).append((subject_name,avg_value))
+    activate_subject(tg,subject_name)
+
+    if is_new:
+        context.user_data.pop("current_subject",None)
+        context.user_data.pop("current_subject_is_new",None)
+        kb=ReplyKeyboardMarkup([["ГОТОВО"],["⬅️ Назад"]],resize_keyboard=True)
+        note="без оцінок" if avg_value is None else f"{avg_value:g}"
+        await update.message.reply_text(
+            f"✅ {subject_name}: {note}.\n"
+            "Напиши назву ще одного НОВОГО предмета або натисни ГОТОВО.",
+            reply_markup=kb
+        )
+        return SUBJECT
+
+    context.user_data["subject_index"]=context.user_data.get("subject_index",0)+1
+    return await prompt_next_saved_subject(update,context)
 
 async def avg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await escape_child_wizard_to_menu(update,context):
         return ConversationHandler.END
+
+    t=(update.message.text or "").strip()
+    tnorm=t.casefold()
+    no_grade_values={
+        "🚫 немає оцінок","немає оцінок","нема оцінок",
+        "немає","нема","без оцінок","-","—"
+    }
+    if tnorm in no_grade_values:
+        return await finish_current_subject(update,context,None)
+
+    if t=="🗑 Прибрати предмет":
+        if context.user_data.get("current_subject_is_new"):
+            context.user_data.pop("current_subject",None)
+            context.user_data.pop("current_subject_is_new",None)
+            await update.message.reply_text("Новий предмет не додано.")
+            return SUBJECT
+
+        subject_name=context.user_data.get("current_subject")
+        if subject_name:
+            deactivate_subject(update.effective_user.id,subject_name)
+        context.user_data["subject_index"]=context.user_data.get("subject_index",0)+1
+        await update.message.reply_text(
+            f"🗑 «{subject_name}» прибрано зі списку. У наступних місяцях він більше не з'являтиметься."
+        )
+        return await prompt_next_saved_subject(update,context)
+
     gmax=grade_max_for_child(update.effective_user.id)
-    try: a=float((update.message.text or "").replace(",","."))
-    except:
+    try:
+        a=float(t.replace(",","."))
+    except ValueError:
         example="5,5" if gmax==6 else "10,7"
-        await update.message.reply_text(f"Введи число, наприклад {example}."); return AVG
+        await update.message.reply_text(
+            f"Введи число, наприклад {example}, або натисни «🚫 Немає оцінок»."
+        )
+        return AVG
     if not 0<=a<=gmax:
-        await update.message.reply_text(f"Бал має бути від 0 до {int(gmax)}."); return AVG
-    context.user_data["subjects"].append((context.user_data["current_subject"],a))
-    await update.message.reply_text("Збережено. Наступний предмет або ГОТОВО:")
-    return SUBJECT
+        await update.message.reply_text(f"Бал має бути від 0 до {int(gmax)}.")
+        return AVG
+    return await finish_current_subject(update,context,a)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("subjects",None)
-    context.user_data.pop("current_subject",None)
+    clear_study_context(context)
     await update.message.reply_text("Скасовано. Нічого не відправлено Андрію.",reply_markup=MENU_CHILD)
     return ConversationHandler.END
 
@@ -1101,7 +1285,9 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"База — {get_base_amount()} грн/міс. Бонусний фонд — до {get_bonus_cap()} грн. Максимум — {get_total_cap()} грн.\n"
         "Навчання: Влад — 12-бальна система, Ромчик — 6-бальна. Кожен сам пише назву предмета й середню оцінку.\n"
-        f"Бонус за навчання бот рахує автоматично, максимум {get_study_cap()} грн.\n\n"
+        f"Бонус за навчання бот рахує автоматично, максимум {get_study_cap()} грн.\n"
+        "Список предметів зберігається між місяцями: у новому періоді дитина лише ставить нові середні бали.\n"
+        "Якщо з предмета цього місяця немає оцінок — обирає «🚫 Немає оцінок»: предмет зберігається, але в розрахунок не входить.\n\n"
         + study_rates_text() +
         "\n\nІнші напрямки: спорт, книги, допомога, саморозвиток.\n\n"
         "📝 Поки місяць у чернетці — можна змінювати й видаляти.\n"
