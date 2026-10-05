@@ -117,6 +117,13 @@ def db():
         min_avg REAL NOT NULL,
         amount INTEGER NOT NULL,
         PRIMARY KEY(scale,min_avg))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS app_settings(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL)""")
+    c.execute(
+        "INSERT OR IGNORE INTO app_settings(key,value) VALUES('study_cap',?)",
+        (str(STUDY_CAP),)
+    )
     for _scale, _rates in DEFAULT_STUDY_RATES.items():
         for _min_avg, _amount in _rates:
             c.execute(
@@ -183,6 +190,26 @@ def grade_system_label(tg_id):
     m=grade_max_for_child(tg_id)
     return "6-бальна" if m==6 else "12-бальна"
 
+def get_study_cap():
+    c=db()
+    r=c.execute("SELECT value FROM app_settings WHERE key='study_cap'").fetchone()
+    c.close()
+    try:
+        return max(0,int(r["value"])) if r else STUDY_CAP
+    except (ValueError,TypeError):
+        return STUDY_CAP
+
+def set_study_cap(amount):
+    amount=max(0,int(amount))
+    c=db()
+    c.execute(
+        """INSERT INTO app_settings(key,value) VALUES('study_cap',?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (str(amount),)
+    )
+    c.commit(); c.close()
+    return amount
+
 def get_study_rates(scale):
     c=db()
     rows=c.execute(
@@ -210,13 +237,13 @@ def study_level(tg_id, avg):
     scale=int(grade_max_for_child(tg_id))
     for threshold,amount in get_study_rates(scale):
         if avg >= threshold:
-            return min(STUDY_CAP,max(0,int(amount)))
+            return min(get_study_cap(),max(0,int(amount)))
     return 0
 
 def calc_study(tg_id, month):
     c=db(); rows=c.execute("SELECT avg FROM subjects WHERE tg_id=? AND month=?",(tg_id,month)).fetchall(); c.close()
     if not rows: return 0
-    return min(STUDY_CAP, round(sum(study_level(tg_id,float(r["avg"])) for r in rows)/len(rows)))
+    return min(get_study_cap(), round(sum(study_level(tg_id,float(r["avg"])) for r in rows)/len(rows)))
 
 def approved_bonus(tg_id, month):
     c=db()
@@ -749,15 +776,52 @@ async def study_rates_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u=get_user(update.effective_user.id)
     if not u or u["role"]!="admin":
         await update.message.reply_text("Спочатку авторизуйся як адміністратор."); return
-    kb=InlineKeyboardMarkup([[
-        InlineKeyboardButton("✏️ 12-бальна",callback_data="ratescale:12"),
-        InlineKeyboardButton("✏️ 6-бальна",callback_data="ratescale:6")
-    ]])
+    cap=get_study_cap()
+    kb=InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ 12-бальна",callback_data="ratescale:12"),
+            InlineKeyboardButton("✏️ 6-бальна",callback_data="ratescale:6")
+        ],
+        [InlineKeyboardButton(f"💰 Максимум за навчання: {cap} грн",callback_data="studycap")]
+    ])
     await update.message.reply_text(
         "⚙️ Поточні ставки за навчання\n\n"+study_rates_text()+
-        f"\n\nМаксимум за навчання: {STUDY_CAP} грн.",
+        f"\n\nМаксимум за навчання: {cap} грн.",
         reply_markup=kb
     )
+
+async def studycap_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    context.user_data["study_cap_edit"]=True
+    await q.message.reply_text(
+        f"Зараз максимум за навчання: {get_study_cap()} грн.\n"
+        "Введи нову максимальну суму одним числом, наприклад 2000."
+    )
+
+async def save_study_cap_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("study_cap_edit"): return False
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin":
+        context.user_data.pop("study_cap_edit",None); return False
+    t=(update.message.text or "").strip().replace(" ","")
+    try:
+        amount=int(t)
+    except ValueError:
+        await update.message.reply_text("Введи лише суму числом, наприклад 2000.")
+        return True
+    if amount<0:
+        await update.message.reply_text("Сума не може бути від'ємною.")
+        return True
+    set_study_cap(amount)
+    context.user_data.pop("study_cap_edit",None)
+    await update.message.reply_text(
+        f"✅ Максимум за навчання змінено на {amount} грн.\n"
+        "Окремі ставки за порогами можеш змінити через «⚙️ Ставки навчання».",
+        reply_markup=MENU_ADMIN
+    )
+    return True
 
 async def ratescale_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
@@ -794,7 +858,7 @@ async def rateedit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["study_rate_edit"]=(scale,threshold)
     await q.message.reply_text(
         f"Введи нову суму для {scale}-бальної системи, поріг {threshold:g}.\n"
-        f"Зараз: {row['amount']} грн. Максимум: {STUDY_CAP} грн.\n"
+        f"Зараз: {row['amount']} грн. Максимум: {get_study_cap()} грн.\n"
         "Просто надішли число, наприклад 450."
     )
 
@@ -810,7 +874,7 @@ async def save_study_rate_text(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError:
         await update.message.reply_text("Введи лише суму числом, наприклад 450.")
         return True
-    amount=max(0,min(amount,STUDY_CAP))
+    amount=max(0,min(amount,get_study_cap()))
     scale,threshold=edit
     c=db()
     c.execute(
@@ -840,7 +904,7 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "База — 2 000 грн/міс. Бонусний фонд — до 4 000 грн. Максимум — 6 000 грн.\n"
         "Навчання: Влад — 12-бальна система, Ромчик — 6-бальна. Кожен сам пише назву предмета й середню оцінку.\n"
-        f"Бонус за навчання бот рахує автоматично, максимум {STUDY_CAP} грн.\n\n"
+        f"Бонус за навчання бот рахує автоматично, максимум {get_study_cap()} грн.\n\n"
         + study_rates_text() +
         "\n\nІнші напрямки: спорт, книги, допомога, саморозвиток.\n\n"
         "📝 Поки місяць у чернетці — можна змінювати й видаляти.\n"
@@ -852,6 +916,9 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("study_cap_edit"):
+        if await save_study_cap_text(update,context): return
+
     if context.user_data.get("study_rate_edit"):
         if await save_study_rate_text(update,context): return
 
@@ -906,6 +973,7 @@ def main():
     app.add_handler(CallbackQueryHandler(month_admin_cb,pattern=r"^month(ok|back):"))
     app.add_handler(CallbackQueryHandler(resetask_cb,pattern=r"^resetask:"))
     app.add_handler(CallbackQueryHandler(reset_cb,pattern=r"^reset(ok|no):"))
+    app.add_handler(CallbackQueryHandler(studycap_cb,pattern=r"^studycap$"))
     app.add_handler(CallbackQueryHandler(ratescale_cb,pattern=r"^ratescale:"))
     app.add_handler(CallbackQueryHandler(rateedit_cb,pattern=r"^rateedit:"))
 
