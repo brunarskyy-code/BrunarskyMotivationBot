@@ -23,11 +23,9 @@ except ValueError:
 DB = os.environ.get("DB_PATH", "motivation.db")
 _db_dir = os.path.dirname(DB)
 if _db_dir:
-    try:
-        os.makedirs(_db_dir, exist_ok=True)
-    except OSError as e:
-        print(f"WARNING: cannot create DB directory {_db_dir}: {e}. Falling back to local motivation.db")
-        DB = "motivation.db"
+    # Never silently switch to a different SQLite file. During migration, doing
+    # so would create a fresh empty database and hide the original history.
+    os.makedirs(_db_dir, exist_ok=True)
 
 BASE = 2000
 BONUS_CAP = 4000
@@ -84,16 +82,9 @@ MENU_EDIT = ReplyKeyboardMarkup([
 ], resize_keyboard=True)
 
 def db():
-    global DB
-    try:
-        c = sqlite3.connect(DB)
-    except sqlite3.OperationalError as e:
-        if DB != "motivation.db":
-            print(f"WARNING: cannot open DB at {DB}: {e}. Falling back to local motivation.db")
-            DB = "motivation.db"
-            c = sqlite3.connect(DB)
-        else:
-            raise
+    # Stop rather than switching to a separate, empty database on I/O failure.
+    # The configured DB_PATH remains authoritative throughout the process.
+    c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     c.execute("""CREATE TABLE IF NOT EXISTS users(
         tg_id INTEGER PRIMARY KEY, role TEXT, name TEXT)""")
