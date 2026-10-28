@@ -21,6 +21,10 @@ except ValueError:
     ADMIN_TG_ID = 0
     print("WARNING: ADMIN_TG_ID must be numeric; starting without auto-admin registration.")
 DB = os.environ.get("DB_PATH", "motivation.db")
+# An explicit DB_PATH must point to an existing migrated database.
+# Refuse startup rather than silently creating an empty database.
+if "DB_PATH" in os.environ and not os.path.isfile(DB):
+    raise FileNotFoundError("Configured DB_PATH does not exist; refusing to create a new database")
 _db_dir = os.path.dirname(DB)
 if _db_dir:
     # Never silently switch to a different SQLite file. During migration, doing
@@ -1479,7 +1483,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/join(?:@\\w+)?(?:\\s+.*)?$"),join))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     app.add_error_handler(error_handler)
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 if __name__=="__main__":
     main()
