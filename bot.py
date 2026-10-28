@@ -21,13 +21,15 @@ except ValueError:
     ADMIN_TG_ID = 0
     print("WARNING: ADMIN_TG_ID must be numeric; starting without auto-admin registration.")
 DB = os.environ.get("DB_PATH", "motivation.db")
+# An explicit DB_PATH must point to an existing migrated database.
+# Refuse startup rather than silently creating an empty database.
+if "DB_PATH" in os.environ and not os.path.isfile(DB):
+    raise FileNotFoundError("Configured DB_PATH does not exist; refusing to create a new database")
 _db_dir = os.path.dirname(DB)
 if _db_dir:
-    try:
-        os.makedirs(_db_dir, exist_ok=True)
-    except OSError as e:
-        print(f"WARNING: cannot create DB directory {_db_dir}: {e}. Falling back to local motivation.db")
-        DB = "motivation.db"
+    # Never silently switch to a different SQLite file. During migration, doing
+    # so would create a fresh empty database and hide the original history.
+    os.makedirs(_db_dir, exist_ok=True)
 
 BASE = 2000
 BONUS_CAP = 4000
@@ -84,16 +86,9 @@ MENU_EDIT = ReplyKeyboardMarkup([
 ], resize_keyboard=True)
 
 def db():
-    global DB
-    try:
-        c = sqlite3.connect(DB)
-    except sqlite3.OperationalError as e:
-        if DB != "motivation.db":
-            print(f"WARNING: cannot open DB at {DB}: {e}. Falling back to local motivation.db")
-            DB = "motivation.db"
-            c = sqlite3.connect(DB)
-        else:
-            raise
+    # Stop rather than switching to a separate, empty database on I/O failure.
+    # The configured DB_PATH remains authoritative throughout the process.
+    c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     c.execute("""CREATE TABLE IF NOT EXISTS users(
         tg_id INTEGER PRIMARY KEY, role TEXT, name TEXT)""")
@@ -1488,7 +1483,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/join(?:@\\w+)?(?:\\s+.*)?$"),join))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     app.add_error_handler(error_handler)
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 if __name__=="__main__":
     main()
