@@ -1837,11 +1837,6 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/join(?:@\\w+)?(?:\\s+.*)?$"),join))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     app.add_error_handler(error_handler)
-    # Temporary deployment-health padding: pushes stale pre-migration errors
-    # out of the deploy helper's short journal window. Removed after one
-    # successful Ubuntu deployment.
-    for _ in range(70):
-        print("MOTIVATION_STARTUP_HEALTH")
     app.run_polling(drop_pending_updates=True)
 
 if __name__=="__main__":
