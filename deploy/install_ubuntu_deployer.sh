@@ -17,6 +17,7 @@ fi
 
 id "$BOT_USER" >/dev/null 2>&1 || { echo "Missing user: $BOT_USER" >&2; exit 1; }
 test -f "$ENV_FILE" || { echo "Missing $ENV_FILE" >&2; exit 1; }
+test -f /etc/telegram-bots/motivation.start-approved || { echo "Missing motivation.start-approved" >&2; exit 1; }
 grep -q '^BOT_TOKEN=' "$ENV_FILE" || { echo "BOT_TOKEN is missing in env file" >&2; exit 1; }
 
 install -d -m 0755 /usr/local/sbin
@@ -37,6 +38,7 @@ exec 9>"$LOCK"
 flock -n 9 || { echo "Another Motivation deployment is already running."; exit 2; }
 
 test -f "$ENV_FILE" || { echo "Missing environment file."; exit 3; }
+test -f /etc/telegram-bots/motivation.start-approved || { echo "Start approval marker is missing."; exit 3; }
 grep -q '^BOT_TOKEN=' "$ENV_FILE" || { echo "BOT_TOKEN key is missing."; exit 4; }
 
 db_path="$(sed -n 's/^DB_PATH=//p' "$ENV_FILE" | tail -n1 | tr -d '"' | tr -d "'")"
