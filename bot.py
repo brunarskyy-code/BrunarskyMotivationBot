@@ -68,13 +68,14 @@ DEFAULT_STUDY_RATES = {
 MENU_CHILD = ReplyKeyboardMarkup([
     ["📝 Заповнити / змінити", "📋 Переглянути місяць"],
     ["📤 Відправити Андрію", "📊 Мій підсумок"],
-    ["❓ Правила"]
+    ["💳 Позика", "❓ Правила"]
 ], resize_keyboard=True)
 
 MENU_ADMIN = ReplyKeyboardMarkup([
     ["👥 Звіти дітей", "✅ На підтвердження"],
     ["♻️ Керування місяцем", "📊 Підсумок місяця"],
-    ["⚙️ Суми та ставки", "❓ Правила"]
+    ["💳 Позики", "⚙️ Суми та ставки"],
+    ["❓ Правила"]
 ], resize_keyboard=True)
 
 MENU_EDIT = ReplyKeyboardMarkup([
@@ -126,6 +127,23 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS app_settings(
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS loans(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tg_id INTEGER NOT NULL,
+        requested_amount INTEGER NOT NULL,
+        requested_months INTEGER NOT NULL,
+        approved_amount INTEGER,
+        approved_months INTEGER,
+        start_month TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        approved_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS loan_installments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        loan_id INTEGER NOT NULL,
+        month TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        UNIQUE(loan_id,month))""")
     for _key,_value in {
         "study_cap": STUDY_CAP,
         "base_amount": BASE,
@@ -172,6 +190,63 @@ def month_key():
     first_this_month=now.replace(day=1)
     previous_month=first_this_month - timedelta(days=1)
     return previous_month.strftime("%Y-%m")
+
+def add_months_key(month, offset):
+    y,m=map(int,month.split("-"))
+    idx=y*12+(m-1)+int(offset)
+    return f"{idx//12:04d}-{idx%12+1:02d}"
+
+def split_installments(total, months):
+    total=max(0,int(total)); months=max(1,int(months))
+    base=total//months
+    rem=total%months
+    return [base+(1 if i<rem else 0) for i in range(months)]
+
+def loan_deduction_for_month(tg_id, month):
+    c=db()
+    r=c.execute(
+        """SELECT COALESCE(SUM(li.amount),0) s
+           FROM loan_installments li
+           JOIN loans l ON l.id=li.loan_id
+           WHERE l.tg_id=? AND li.month=? AND l.status IN ('active','paid')""",
+        (tg_id,month)
+    ).fetchone()
+    c.close()
+    return int(r["s"])
+
+def active_loan_balance(tg_id, after_month=None):
+    c=db()
+    if after_month:
+        r=c.execute(
+            """SELECT COALESCE(SUM(li.amount),0) s
+               FROM loan_installments li
+               JOIN loans l ON l.id=li.loan_id
+               WHERE l.tg_id=? AND li.month>? AND l.status IN ('active','paid')""",
+            (tg_id,after_month)
+        ).fetchone()
+    else:
+        r=c.execute(
+            """SELECT COALESCE(SUM(li.amount),0) s
+               FROM loan_installments li
+               JOIN loans l ON l.id=li.loan_id
+               WHERE l.tg_id=? AND l.status='active'""",
+            (tg_id,)
+        ).fetchone()
+    c.close()
+    return int(r["s"])
+
+def refresh_loan_statuses(current_month=None):
+    current_month=current_month or month_key()
+    c=db()
+    rows=c.execute("SELECT id FROM loans WHERE status='active'").fetchall()
+    for row in rows:
+        future=c.execute(
+            "SELECT COUNT(*) n FROM loan_installments WHERE loan_id=? AND month>=?",
+            (row["id"],current_month)
+        ).fetchone()["n"]
+        if future==0:
+            c.execute("UPDATE loans SET status='paid' WHERE id=?",(row["id"],))
+    c.commit(); c.close()
 
 def register(tg_id, role, name):
     c=db()
@@ -340,10 +415,16 @@ def projected_summary(tg_id, month):
     total=min(get_total_cap(),base+bonus)
     return study,other,bonus,total
 
+def payout_after_loan(tg_id, month, gross_total):
+    deduction=loan_deduction_for_month(tg_id,month)
+    payable=max(0,int(gross_total)-deduction)
+    return deduction,payable
+
 def admin_detailed_text(tg_id, month):
     u=get_user(tg_id)
     st=month_status(tg_id,month)
     study,other,bonus,total=projected_summary(tg_id,month)
+    loan_deduction,payable=payout_after_loan(tg_id,month,total)
     text=month_text(tg_id,month)
     label="Підтверджено" if st=="approved" else "Попередній розрахунок"
     return (
@@ -354,29 +435,34 @@ def admin_detailed_text(tg_id, month):
         f"• Досягнення: {other} грн\n"
         f"• Бонуси після загального ліміту: {bonus} грн\n"
         f"💰 {label}: {total} грн\n"
-        f"  70% особисті: {round(total*.7)} грн\n"
-        f"  20% накопичення: {round(total*.2)} грн\n"
-        f"  10% добрі справи: {round(total*.1)} грн"
+        f"• Утримання позики: -{loan_deduction} грн\n"
+        f"💳 До переказу: {payable} грн\n"
+        f"  70% особисті: {round(payable*.7)} грн\n"
+        f"  20% накопичення: {round(payable*.2)} грн\n"
+        f"  10% добрі справи: {round(payable*.1)} грн"
     )
 
 def admin_short_child_text(tg_id, month):
     u=get_user(tg_id)
     st=month_status(tg_id,month)
     study,other,bonus,total=projected_summary(tg_id,month)
+    deduction,payable=payout_after_loan(tg_id,month,total)
     lines=[
         f"👤 {u['name'] if u else tg_id}",
         f"🎓 Навчання: {study} грн",
         f"🏆 Досягнення: {other} грн",
         f"💵 База: {get_base_amount()} грн",
+        f"💰 Нараховано: {total} грн",
+        f"💳 Позика: -{deduction} грн",
     ]
     if st=="approved":
-        lines.append(f"💳 ДО ПЕРЕКАЗУ: {total} грн")
+        lines.append(f"💳 ДО ПЕРЕКАЗУ: {payable} грн")
         lines.append(
-            f"70%: {round(total*.7)} · 20%: {round(total*.2)} · 10%: {round(total*.1)} грн"
+            f"70%: {round(payable*.7)} · 20%: {round(payable*.2)} · 10%: {round(payable*.1)} грн"
         )
     else:
-        lines.append(f"⏳ Ще не підтверджено · після підтвердження: {total} грн")
-    return "\n".join(lines), (total if st=="approved" else 0)
+        lines.append(f"⏳ Ще не підтверджено · після підтвердження: {payable} грн")
+    return "\n".join(lines), (payable if st=="approved" else 0)
 
 def status_label(s):
     return {"draft":"📝 Чернетка","submitted":"⏳ Надіслано Андрію","approved":"🔒 Підтверджено"}.get(s,s)
@@ -1096,12 +1182,257 @@ async def my_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u or u["role"]!="child": return
     m=month_key(); s,o,b,t=summary(u["tg_id"],m)
     st=month_status(u["tg_id"],m)
+    deduction,payable=payout_after_loan(u["tg_id"],m,t)
     await update.message.reply_text(
         f"📊 {u['name']} — {m}\n{status_label(st)}\n"
         f"База: {get_base_amount()} грн\nНавчання підтверджено: {s} грн\nІнші підтверджені: {o} грн\n"
-        f"Бонуси разом (до {get_bonus_cap()}): {b} грн\n\n💰 Разом: {t} грн (макс. {get_total_cap()})\n"
-        f"70% особисті: {round(t*.7)} грн\n20% накопичення: {round(t*.2)} грн\n10% добрі справи: {round(t*.1)} грн"
+        f"Бонуси разом (до {get_bonus_cap()}): {b} грн\n\n"
+        f"💰 Нараховано: {t} грн (макс. {get_total_cap()})\n"
+        f"💳 Утримання позики: -{deduction} грн\n"
+        f"💵 До переказу: {payable} грн\n"
+        f"70% особисті: {round(payable*.7)} грн\n20% накопичення: {round(payable*.2)} грн\n10% добрі справи: {round(payable*.1)} грн"
     )
+
+# ---------- Loans ----------
+LOAN_AMOUNT, LOAN_MONTHS = 20, 21
+
+async def loan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="child": return ConversationHandler.END
+    context.user_data.pop("loan_request_amount",None)
+    await update.message.reply_text(
+        "💳 Позика\n\nЯку суму хочеш попросити наперед?\n"
+        "Введи суму в гривнях, наприклад: 4000\n"
+        "Для скасування — /cancel",
+        reply_markup=ReplyKeyboardMarkup([["⬅️ Назад"]],resize_keyboard=True)
+    )
+    return LOAN_AMOUNT
+
+async def loan_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t=(update.message.text or "").strip().replace(" ","")
+    if t=="⬅️Назад" or (update.message.text or "").strip()=="⬅️ Назад":
+        await update.message.reply_text("Головне меню.",reply_markup=MENU_CHILD)
+        return ConversationHandler.END
+    try:
+        amount=int(t)
+    except ValueError:
+        await update.message.reply_text("Введи суму числом, наприклад 4000.")
+        return LOAN_AMOUNT
+    if amount<=0:
+        await update.message.reply_text("Сума має бути більшою за 0.")
+        return LOAN_AMOUNT
+    context.user_data["loan_request_amount"]=amount
+    await update.message.reply_text(
+        f"Сума: {amount} грн.\nНа скільки місяців просиш позику?\nНаприклад: 3"
+    )
+    return LOAN_MONTHS
+
+async def loan_months_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        months=int((update.message.text or "").strip())
+    except ValueError:
+        await update.message.reply_text("Введи кількість місяців числом, наприклад 3.")
+        return LOAN_MONTHS
+    if months<1 or months>24:
+        await update.message.reply_text("Термін має бути від 1 до 24 місяців.")
+        return LOAN_MONTHS
+    amount=context.user_data.get("loan_request_amount")
+    if not amount:
+        await update.message.reply_text("Почни заявку заново через «💳 Позика».",reply_markup=MENU_CHILD)
+        return ConversationHandler.END
+    tg=update.effective_user.id
+    u=get_user(tg)
+    c=db()
+    cur=c.execute(
+        "INSERT INTO loans(tg_id,requested_amount,requested_months,status) VALUES(?,?,?,'pending')",
+        (tg,amount,months)
+    )
+    loan_id=cur.lastrowid
+    c.commit(); c.close()
+    context.user_data.pop("loan_request_amount",None)
+    await update.message.reply_text(
+        f"✅ Заявку на позику надіслано Андрію.\n"
+        f"Просиш: {amount} грн на {months} міс.",
+        reply_markup=MENU_CHILD
+    )
+    aid=admin_id()
+    if aid:
+        kb=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Розглянути",callback_data=f"loanapprove:{loan_id}"),
+            InlineKeyboardButton("❌ Відхилити",callback_data=f"loanreject:{loan_id}")
+        ]])
+        await context.bot.send_message(
+            aid,
+            f"💳 Нова заявка на позику\n"
+            f"👤 {u['name']}\n"
+            f"Просить: {amount} грн\n"
+            f"Термін: {months} міс.\n\n"
+            "Ти сам задаєш фактично видану суму і термін.",
+            reply_markup=kb
+        )
+    return ConversationHandler.END
+
+async def loan_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("loan_request_amount",None)
+    await update.message.reply_text("Заявку скасовано.",reply_markup=MENU_CHILD)
+    return ConversationHandler.END
+
+async def loanapprove_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    loan_id=int(q.data.split(":")[1])
+    c=db(); row=c.execute("SELECT * FROM loans WHERE id=?",(loan_id,)).fetchone(); c.close()
+    if not row or row["status"]!="pending":
+        await q.message.reply_text("Заявка вже оброблена."); return
+    child=get_user(row["tg_id"])
+    context.user_data["loan_admin_id"]=loan_id
+    context.user_data["loan_admin_step"]="amount"
+    await q.message.reply_text(
+        f"💳 {child['name']} просить {row['requested_amount']} грн на {row['requested_months']} міс.\n\n"
+        "Введи ФАКТИЧНУ суму, яку ти перекинув дитині. Наприклад: 4000"
+    )
+
+async def loanreject_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    u=get_user(q.from_user.id)
+    if not u or u["role"]!="admin": return
+    loan_id=int(q.data.split(":")[1])
+    c=db(); row=c.execute("SELECT * FROM loans WHERE id=?",(loan_id,)).fetchone()
+    if not row or row["status"]!="pending":
+        c.close(); await q.message.reply_text("Заявка вже оброблена."); return
+    c.execute("UPDATE loans SET status='rejected' WHERE id=?",(loan_id,))
+    c.commit(); c.close()
+    child=get_user(row["tg_id"])
+    await q.edit_message_text(q.message.text+"\n\n❌ Відхилено.")
+    await context.bot.send_message(row["tg_id"],"❌ Андрій відхилив заявку на позику.",reply_markup=MENU_CHILD)
+
+async def save_loan_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loan_id=context.user_data.get("loan_admin_id")
+    step=context.user_data.get("loan_admin_step")
+    if not loan_id or not step: return False
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin":
+        context.user_data.pop("loan_admin_id",None)
+        context.user_data.pop("loan_admin_step",None)
+        return False
+
+    raw=(update.message.text or "").strip().replace(" ","")
+    try:
+        value=int(raw)
+    except ValueError:
+        await update.message.reply_text("Введи число.")
+        return True
+    if value<=0:
+        await update.message.reply_text("Значення має бути більше 0.")
+        return True
+
+    if step=="amount":
+        context.user_data["loan_admin_amount"]=value
+        context.user_data["loan_admin_step"]="months"
+        await update.message.reply_text(
+            f"Фактично видано: {value} грн.\n"
+            "Тепер введи термін утримання в місяцях, наприклад 3."
+        )
+        return True
+
+    if step=="months":
+        if value>24:
+            await update.message.reply_text("Термін має бути від 1 до 24 місяців.")
+            return True
+        amount=context.user_data.get("loan_admin_amount")
+        if not amount:
+            await update.message.reply_text("Не бачу суми. Натисни заявку ще раз.")
+            return True
+        c=db(); row=c.execute("SELECT * FROM loans WHERE id=?",(loan_id,)).fetchone()
+        if not row or row["status"]!="pending":
+            c.close()
+            context.user_data.pop("loan_admin_id",None)
+            context.user_data.pop("loan_admin_step",None)
+            context.user_data.pop("loan_admin_amount",None)
+            await update.message.reply_text("Заявка вже оброблена.")
+            return True
+
+        start=month_key()
+        installments=split_installments(amount,value)
+        c.execute(
+            """UPDATE loans SET approved_amount=?,approved_months=?,start_month=?,
+               status='active',approved_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (amount,value,start,loan_id)
+        )
+        for i,inst in enumerate(installments):
+            c.execute(
+                "INSERT OR REPLACE INTO loan_installments(loan_id,month,amount) VALUES(?,?,?)",
+                (loan_id,add_months_key(start,i),inst)
+            )
+        c.commit(); c.close()
+
+        child=get_user(row["tg_id"])
+        schedule=", ".join(
+            f"{add_months_key(start,i)}: {inst} грн" for i,inst in enumerate(installments)
+        )
+        context.user_data.pop("loan_admin_id",None)
+        context.user_data.pop("loan_admin_step",None)
+        context.user_data.pop("loan_admin_amount",None)
+        await update.message.reply_text(
+            f"✅ Позика активована для {child['name']}.\n"
+            f"Видано: {amount} грн\n"
+            f"Термін: {value} міс.\n"
+            f"Графік: {schedule}",
+            reply_markup=MENU_ADMIN
+        )
+        await context.bot.send_message(
+            row["tg_id"],
+            f"✅ Андрій погодив позику.\n"
+            f"Видано: {amount} грн\n"
+            f"Термін: {value} міс.\n"
+            f"Щомісяця утримання відображатиметься у «📊 Мій підсумок».",
+            reply_markup=MENU_CHILD
+        )
+        return True
+    return False
+
+async def loans_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u=get_user(update.effective_user.id)
+    if not u or u["role"]!="admin": return
+    refresh_loan_statuses()
+    c=db()
+    rows=c.execute(
+        """SELECT l.*,u.name FROM loans l
+           LEFT JOIN users u ON u.tg_id=l.tg_id
+           WHERE l.status IN ('pending','active')
+           ORDER BY CASE l.status WHEN 'pending' THEN 0 ELSE 1 END,l.id"""
+    ).fetchall()
+    c.close()
+    if not rows:
+        await update.message.reply_text("Активних або нових заявок на позику немає.")
+        return
+    for r in rows:
+        if r["status"]=="pending":
+            kb=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Розглянути",callback_data=f"loanapprove:{r['id']}"),
+                InlineKeyboardButton("❌ Відхилити",callback_data=f"loanreject:{r['id']}")
+            ]])
+            await update.message.reply_text(
+                f"⏳ #{r['id']} {r['name']}\n"
+                f"Просить {r['requested_amount']} грн на {r['requested_months']} міс.",
+                reply_markup=kb
+            )
+        else:
+            c=db()
+            inst=c.execute(
+                "SELECT month,amount FROM loan_installments WHERE loan_id=? ORDER BY month",
+                (r["id"],)
+            ).fetchall()
+            c.close()
+            future=[x for x in inst if x["month"]>=month_key()]
+            remain=sum(x["amount"] for x in future)
+            schedule="\n".join(f"• {x['month']}: {x['amount']} грн" for x in future)
+            await update.message.reply_text(
+                f"💳 #{r['id']} {r['name']} — активна\n"
+                f"Видано: {r['approved_amount']} грн на {r['approved_months']} міс.\n"
+                f"Залишилось за графіком: {remain} грн\n{schedule}"
+            )
 
 MONEY_SETTING_LABELS = {
     "base_amount": "💵 База",
@@ -1395,10 +1726,15 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "↩️ Андрій може повернути на виправлення.\n"
         "🔒 Після підтвердження місяць заблокований.\n"
         "♻️ При скиданні місяця попередня версія зберігається в архіві.\n\n"
+        "💳 Позика: дитина може попросити кошти наперед. Андрій сам підтверджує фактично видану суму й термін. "
+        "Сума ділиться на рівні щомісячні частини та автоматично віднімається від місячної виплати.\n\n"
         "Гроші: 70% особисті витрати / 20% накопичення / 10% добрі справи."
     )
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("loan_admin_id"):
+        if await save_loan_admin_text(update,context): return
+
     if context.user_data.get("money_setting_edit"):
         if await save_money_setting_text(update,context): return
 
@@ -1423,6 +1759,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if t=="📋 Переглянути місяць": return await view_month(update,context)
         if t=="📤 Відправити Андрію": return await submit_month(update,context)
         if t=="📊 Мій підсумок": return await my_summary(update,context)
+        if t=="💳 Позика": return await loan_start(update,context)
         if t=="✏️ Змінити досягнення": return await edit_menu(update,context)
         if t=="🗑 Видалити досягнення": return await delete_menu(update,context)
         if t=="🧹 Очистити мою чернетку": return await clear_draft(update,context)
@@ -1434,6 +1771,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if t=="📊 Підсумок місяця": return await admin_month_summary(update,context)
         if t=="✅ На підтвердження": return await pending_admin(update,context)
         if t=="♻️ Керування місяцем": return await reset_menu(update,context)
+        if t=="💳 Позики": return await loans_admin(update,context)
         if t in ("⚙️ Суми та ставки","⚙️ Ставки навчання"): return await money_settings_menu(update,context)
 
 async def error_handler(update, context):
@@ -1465,6 +1803,8 @@ def main():
     app.add_handler(CallbackQueryHandler(studycap_cb,pattern=r"^studycap$"))
     app.add_handler(CallbackQueryHandler(ratescale_cb,pattern=r"^ratescale:"))
     app.add_handler(CallbackQueryHandler(rateedit_cb,pattern=r"^rateedit:"))
+    app.add_handler(CallbackQueryHandler(loanapprove_cb,pattern=r"^loanapprove:"))
+    app.add_handler(CallbackQueryHandler(loanreject_cb,pattern=r"^loanreject:"))
 
     app.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^📚 Навчання$"),report_start)],
@@ -1482,6 +1822,15 @@ def main():
             DESC:[MessageHandler(filters.TEXT & ~filters.COMMAND,desc)]
         },
         fallbacks=[CommandHandler("cancel",cancel)],
+        allow_reentry=True
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^💳 Позика$"),loan_start)],
+        states={
+            LOAN_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND,loan_amount_input)],
+            LOAN_MONTHS:[MessageHandler(filters.TEXT & ~filters.COMMAND,loan_months_input)]
+        },
+        fallbacks=[CommandHandler("cancel",loan_cancel)],
         allow_reentry=True
     ))
 
